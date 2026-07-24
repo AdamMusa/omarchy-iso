@@ -163,6 +163,7 @@ qemu-system-x86_64 \
   -device virtio-vga-gl \
   -display sdl,gl=on \
   -usb -device usb-tablet \
+  -serial none \
   "${NET_ARGS[@]}" \
   -boot menu=on \
   "${EXTRA_QEMU_ARGS[@]}"
