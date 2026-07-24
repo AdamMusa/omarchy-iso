@@ -2,9 +2,9 @@
 
 Phase ordering (full-disk and protected/pre-mounted):
 
-    prepare_live           → pacman-key init, disk cleanup when wiping,
-                             load configurator handlers (archinstall patch
-                             happens in the wrapper before Python imports it)
+    prepare_live           → disk cleanup when wiping, load configurator
+                             handlers (archinstall patch happens in the
+                             wrapper before Python imports it)
     prepare_install_target → verify pre-mounted target/ESP when the JSON uses
                              pre_mounted_config; no-op for full-disk installs
     arch_install_system    → one archinstall flow for partition/mount-or-use,
@@ -153,23 +153,23 @@ def _early_packages() -> list[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# prepare_live: ready the live ISO for the install — pacman keyring init,
-# tear down any previous holders on the install disk (via the bash helper),
-# then parse the configurator output.
+# prepare_live: ready the live ISO for the install — tear down any previous
+# holders on the install disk (via the bash helper), then parse the
+# configurator output.
+#
+# The live pacman keyring is deliberately NOT waited on. The offline repo is
+# SigLevel = Optional TrustAll and archinstall bootstraps with pacstrap -K,
+# which initializes an independent keyring inside the target, so no install
+# step consults the live keyring. archiso's boot-time pacman-init.service
+# (gpg key generation + populating every keyring, Type=oneshot with no start
+# timeout) can take minutes on real hardware reading from USB — blocking on
+# it here stalled installs at 5% while it ground away in the background.
 #
 # archinstall is patched in the wrapper (omarchy-iso-install) BEFORE Python
 # imports it, so no patching happens here.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def prepare_live(ctx: InstallContext) -> None:
-    # archiso's pacman-init.service initializes and populates every installed
-    # keyring before the live environment reaches multi-user.target. Pacstrap
-    # then initializes the target's independent keyring, and archinstall does
-    # its own repository sync before the first package transaction. Repeating
-    # both operations here only rebuilds trust databases and syncs twice.
-    info("› verifying live pacman initialization")
-    subprocess.run(["systemctl", "start", "pacman-init.service"], check=True)
-
     if ctx.is_protected:
         info("› protected mode: skipping whole-disk cleanup")
     else:
