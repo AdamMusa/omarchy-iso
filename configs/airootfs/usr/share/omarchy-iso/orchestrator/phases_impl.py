@@ -1290,9 +1290,14 @@ def validate_boot(ctx: InstallContext) -> None:
         if not limine_binary.exists() or limine_binary.stat().st_size == 0:
             raise RuntimeError(f"{limine_binary} missing or empty")
 
-        uki = esp_mount / "EFI" / "Linux" / f"{uki_prefix}_{kernel}.efi"
-        if not uki.exists() or uki.stat().st_size == 0:
-            raise RuntimeError(f"{uki} missing or empty")
+        # Hardware packages (omarchy-hw-intel-ptl, …) can swap the kernel out
+        # from under us mid-install, so trust what's on disk over what we asked
+        # for and only fall back to the configured name when nothing's there.
+        uki_dir = esp_mount / "EFI" / "Linux"
+        candidates = _installed_kernels(ctx) or [kernel]
+        ukis = [uki_dir / f"{uki_prefix}_{name}.efi" for name in candidates]
+        if not any(uki.exists() and uki.stat().st_size for uki in ukis):
+            raise RuntimeError(f"{' / '.join(str(uki) for uki in ukis)} missing or empty")
 
         post = _read_efibootmgr()
         if not _find_label_entries(post["entries"], "Limine"):
@@ -1300,6 +1305,17 @@ def validate_boot(ctx: InstallContext) -> None:
 
     if ctx.is_protected:
         _validate_pre_mounted_filesystems(ctx)
+
+
+# Every kernel package leaves its pkgbase next to its modules, which is also
+# the name limine-mkinitcpio-hook builds the UKI under.
+def _installed_kernels(ctx: InstallContext) -> list[str]:
+    names = []
+    for pkgbase in sorted((ctx.target / "usr" / "lib" / "modules").glob("*/pkgbase")):
+        name = pkgbase.read_text().strip()
+        if name and name not in names:
+            names.append(name)
+    return names
 
 
 def _validate_pre_mounted_filesystems(ctx: InstallContext) -> None:
