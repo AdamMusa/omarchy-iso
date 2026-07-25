@@ -99,11 +99,23 @@ def perform_filesystem_operations(arch_config: ArchConfig) -> None:
 
     handler = FilesystemHandler(arch_config.disk_config)
 
+    # archinstall's perform_filesystem_operations defaults to a ~4.5s
+    # "5...4...3...2...1" countdown (FilesystemHandler._final_warning) before it
+    # wipes the disk. That warning is meant for its interactive TUI; in our
+    # orchestrated install it renders nowhere and just sleeps. Suppress it when
+    # the running archinstall still takes the flag — newer releases dropped both
+    # the countdown and the parameter, so only pass it when it's accepted.
+    fs_kwargs = (
+        {"show_countdown": False}
+        if _method_accepts(handler.perform_filesystem_operations, "show_countdown")
+        else {}
+    )
+
     attempts = 3
     for attempt in range(1, attempts + 1):
         udev_sync()
         try:
-            handler.perform_filesystem_operations()
+            handler.perform_filesystem_operations(**fs_kwargs)
             return
         except Exception as exc:
             if attempt == attempts or "unable to inform the kernel" not in str(exc):
@@ -185,8 +197,8 @@ def _application_handler():
     return handler
 
 
-def _method_accepts_users(method) -> bool:
-    """Return whether a bound archinstall method accepts the users argument.
+def _method_accepts(method, name: str) -> bool:
+    """Return whether a bound archinstall method accepts a named argument.
 
     Do not use inspect.signature here: Python 3.14 may evaluate archinstall's
     lazy annotations, and some archinstall releases annotate with names that are
@@ -199,7 +211,11 @@ def _method_accepts_users(method) -> bool:
 
     positional = code.co_varnames[:code.co_argcount]
     kwonly = code.co_varnames[code.co_argcount:code.co_argcount + code.co_kwonlyargcount]
-    return "users" in (*positional, *kwonly)
+    return name in (*positional, *kwonly)
+
+
+def _method_accepts_users(method) -> bool:
+    return _method_accepts(method, "users")
 
 
 def install_applications(installer: Installer, arch_config: ArchConfig) -> None:
