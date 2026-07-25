@@ -570,12 +570,11 @@ DEFERRED_BOOT_HOOKS = (
 def _drop_archinstall_zram_conf(ctx: InstallContext) -> None:
     """Remove the zram-generator.conf archinstall's setup_swap writes directly.
 
-    omarchy-settings now ships its own /etc/systemd/zram-generator.conf as a
-    packaged file. setup_swap writes a generic config to that same path before
-    we pacstrap omarchy-settings, so pacman aborts the transaction with a file
-    conflict ("zram-generator.conf exists in filesystem"). Delete archinstall's
-    copy here — we still want the zram-generator package and service that
-    setup_swap installs, but omarchy-settings' config is the one to keep.
+    omarchy-settings ships the tuning as a vendor drop-in at
+    /usr/lib/systemd/zram-generator.conf.d/90-omarchy.conf, which outranks the
+    main config file. setup_swap's generic /etc copy decides nothing and only
+    implies /etc is where zram gets configured, so drop it — we still want the
+    zram-generator package and service that setup_swap installs.
     """
     zram_conf = ctx.target / "etc" / "systemd" / "zram-generator.conf"
     zram_conf.unlink(missing_ok=True)
