@@ -262,6 +262,7 @@ def arch_install_system(ctx: InstallContext) -> None:
 
             if config.swap and config.swap.enabled:
                 installer.setup_swap(algo=config.swap.algorithm)
+                _drop_archinstall_zram_conf(ctx)
 
             _install_early_packages(installer)
             _configure_limine_boot(ctx, installer, config)
@@ -564,6 +565,20 @@ DEFERRED_BOOT_HOOKS = (
     "90-limine-mkinitcpio-remove-post.hook",
     "90-mkinitcpio-install.hook",
 )
+
+
+def _drop_archinstall_zram_conf(ctx: InstallContext) -> None:
+    """Remove the zram-generator.conf archinstall's setup_swap writes directly.
+
+    omarchy-settings now ships its own /etc/systemd/zram-generator.conf as a
+    packaged file. setup_swap writes a generic config to that same path before
+    we pacstrap omarchy-settings, so pacman aborts the transaction with a file
+    conflict ("zram-generator.conf exists in filesystem"). Delete archinstall's
+    copy here — we still want the zram-generator package and service that
+    setup_swap installs, but omarchy-settings' config is the one to keep.
+    """
+    zram_conf = ctx.target / "etc" / "systemd" / "zram-generator.conf"
+    zram_conf.unlink(missing_ok=True)
 
 
 def _install_early_packages(installer) -> None:
