@@ -13,13 +13,19 @@ arch="x86_64"
 pacman_conf="pacman-offline.conf"
 airootfs_image_type="squashfs"
 # Package archives in the offline mirror are already zstd-compressed. Storing
-# them in an outer XZ stream saves little space but makes pacman decompress XZ
-# while hashing and extracting every package during installation.
+# them in an outer stream saves little space but makes pacman decompress the
+# outer layer while hashing and extracting every package during installation.
+#
+# Everything else in the live root is zstd rather than xz. Squashfs decompresses
+# on the page-fault path through a single stream (CONFIG_SQUASHFS_DECOMP_SINGLE),
+# where xz manages ~100MB/s against zstd's ~900MB/s, and the live root is read
+# cold on every boot: kernel, plymouth, systemd, python, archinstall, gum. The
+# whole ISO grows well under a percent for it, and dropping the x86 BCJ filter
+# also removes one of the blockers listed in plans/aarch64-support.md.
 airootfs_image_tool_options=(
-  '-comp' 'xz'
-  '-Xbcj' 'x86'
+  '-comp' 'zstd'
+  '-Xcompression-level' '19'
   '-b' '1M'
-  '-Xdict-size' '1M'
   '-action' 'uncompressed@subpathname(var/cache/omarchy/mirror/offline)'
 )
 bootstrap_tarball_compression=('zstd' '-c' '-T0' '--auto-threads=logical' '--long' '-19')
