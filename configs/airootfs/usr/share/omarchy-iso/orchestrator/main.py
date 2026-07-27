@@ -64,7 +64,11 @@ def main() -> int:
 
     info(f"Installing Omarchy for {ctx.username} → {ctx.target}")
 
-    from .phases_impl import cleanup_bind_mounts, cleanup_protected_state
+    from .phases_impl import (
+        cleanup_bind_mounts,
+        cleanup_protected_state,
+        cleanup_target_hook_masks,
+    )
 
     success = False
     try:
@@ -82,6 +86,7 @@ def main() -> int:
         return 0
     finally:
         cleanup_bind_mounts(ctx)
+        cleanup_target_hook_masks(ctx)
         if not success:
             cleanup_protected_state(ctx)
 

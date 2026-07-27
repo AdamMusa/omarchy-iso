@@ -566,6 +566,22 @@ DEFERRED_BOOT_HOOKS = (
     "90-mkinitcpio-install.hook",
 )
 
+# Inside the target chroot, only the install hook is worth deferring.
+# limine-entry-tool's 90-mkinitcpio-install.hook triggers on usr/lib/firmware/*,
+# usr/src/*/dkms.conf and usr/lib/modules/*/pkgbase, and anything but a
+# usr/lib/modules path makes it rebuild the initramfs and UKI for EVERY
+# installed kernel. omarchy-setup-system's hardware scripts routinely install
+# such packages (sof-firmware on Intel audio, nvidia-open-dkms, linux-ptl on
+# Panther Lake, linux-t2 on Macs), so the phase can pay for several full UKI
+# builds. finalize_limine_boot runs limine-update right after, which pipes
+# "rebuild" into the same script and rebuilds every kernel unconditionally —
+# those mid-phase builds are always thrown away, and are stale anyway (nvidia.sh
+# writes its mkinitcpio drop-in after installing the driver).
+#
+# The kernel-removal hooks stay live: they only prune Limine entries, which is
+# exactly what ptl-kernel.sh's "pacman -Rdd linux" needs.
+TARGET_DEFERRED_BOOT_HOOKS = ("90-mkinitcpio-install.hook",)
+
 
 def _drop_archinstall_zram_conf(ctx: InstallContext) -> None:
     """Remove the zram-generator.conf archinstall's setup_swap writes directly.
@@ -630,18 +646,26 @@ def _is_devnull_symlink(path: Path) -> bool:
         return False
 
 
-def _mask_mkinitcpio_pacman_hooks(ctx: InstallContext) -> None:
-    """Temporarily suppress boot-image pacman hooks during pacstrap.
+def _mask_mkinitcpio_pacman_hooks(
+    ctx: InstallContext,
+    root: Path = Path("/"),
+    names: tuple[str, ...] = DEFERRED_BOOT_HOOKS,
+) -> None:
+    """Temporarily suppress boot-image pacman hooks around a package install.
 
-    pacstrap uses the live system's /etc/pacman.conf. pacman.conf(5) notes that
-    HookDir is absolute and the target root is not prepended, so target-side
-    /mnt/etc/pacman.d/hooks masks do not override target /usr/share/libalpm
-    hooks during installation. Mask the live HookDir instead; the target's real
-    hooks still get installed and become active after reboot.
+    With the default root this masks the LIVE hook dir, which is what pacstrap
+    reads: pacstrap uses the live system's /etc/pacman.conf, and pacman.conf(5)
+    notes that HookDir is absolute and the target root is not prepended, so
+    target-side /mnt/etc/pacman.d/hooks masks do not override target
+    /usr/share/libalpm hooks during installation. The target's real hooks still
+    get installed and become active after reboot.
+
+    Passing ctx.target masks the same way inside the target, for pacman runs
+    that happen under arch-chroot (see TARGET_DEFERRED_BOOT_HOOKS).
     """
-    hooks_dir = Path("/etc/pacman.d/hooks")
+    hooks_dir = root / "etc/pacman.d/hooks"
     hooks_dir.mkdir(parents=True, exist_ok=True)
-    for name in DEFERRED_BOOT_HOOKS:
+    for name in names:
         path = hooks_dir / name
         backup = hooks_dir / f"{name}.omarchy-backup"
         if _is_devnull_symlink(path):
@@ -652,9 +676,13 @@ def _mask_mkinitcpio_pacman_hooks(ctx: InstallContext) -> None:
         path.symlink_to("/dev/null")
 
 
-def _unmask_mkinitcpio_pacman_hooks(ctx: InstallContext) -> None:
-    hooks_dir = Path("/etc/pacman.d/hooks")
-    for name in DEFERRED_BOOT_HOOKS:
+def _unmask_mkinitcpio_pacman_hooks(
+    ctx: InstallContext,
+    root: Path = Path("/"),
+    names: tuple[str, ...] = DEFERRED_BOOT_HOOKS,
+) -> None:
+    hooks_dir = root / "etc/pacman.d/hooks"
+    for name in names:
         path = hooks_dir / name
         backup = hooks_dir / f"{name}.omarchy-backup"
         try:
@@ -1080,10 +1108,14 @@ def _run_target_setup_command(ctx: InstallContext, cmd: list[str], *, user: str 
 
 
 def run_system_finalizer(ctx: InstallContext) -> None:
-    _run_target_setup_command(
-        ctx,
-        ["/usr/bin/omarchy-setup-system", "--install-user", ctx.username, "--first-install"],
-    )
+    _mask_mkinitcpio_pacman_hooks(ctx, ctx.target, TARGET_DEFERRED_BOOT_HOOKS)
+    try:
+        _run_target_setup_command(
+            ctx,
+            ["/usr/bin/omarchy-setup-system", "--install-user", ctx.username, "--first-install"],
+        )
+    finally:
+        _unmask_mkinitcpio_pacman_hooks(ctx, ctx.target, TARGET_DEFERRED_BOOT_HOOKS)
 
 
 def finalize_limine_boot(ctx: InstallContext) -> None:
@@ -1261,6 +1293,8 @@ def configure_login(ctx: InstallContext) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def validate_boot(ctx: InstallContext) -> None:
+    _assert_boot_hooks_restored(ctx)
+
     boot = _boot_intent(ctx)
     storage = _storage_intent(ctx)
     esp_mount = ctx.target / boot["esp_mount"].lstrip("/")
@@ -1306,6 +1340,30 @@ def validate_boot(ctx: InstallContext) -> None:
         _validate_pre_mounted_filesystems(ctx)
 
 
+def _assert_boot_hooks_restored(ctx: InstallContext) -> None:
+    """Never hand over a system whose UKI rebuild hook is still masked.
+
+    run_system_finalizer defers 90-mkinitcpio-install.hook inside the target and
+    restores it in a finally, but a mask that survived would be invisible until
+    the first kernel update shipped a UKI-less boot. Repair, then insist.
+    """
+    cleanup_target_hook_masks(ctx)
+
+    hooks_dir = ctx.target / "etc/pacman.d/hooks"
+    for name in TARGET_DEFERRED_BOOT_HOOKS:
+        path = hooks_dir / name
+        if _is_devnull_symlink(path):
+            raise RuntimeError(f"{path} is still masked to /dev/null")
+        backup = hooks_dir / f"{name}.omarchy-backup"
+        if backup.exists() or backup.is_symlink():
+            raise RuntimeError(f"{backup} left behind by the install-time hook mask")
+        # limine-mkinitcpio-hook is a hard dependency of the Omarchy runtime
+        # package, so the real hook is on disk before the mask ever goes up and
+        # must be on disk again now.
+        if not path.is_file():
+            raise RuntimeError(f"{path} is missing — future kernel updates would ship no UKI")
+
+
 # Every kernel package leaves its pkgbase next to its modules, which is also
 # the name limine-mkinitcpio-hook builds the UKI under.
 def _installed_kernels(ctx: InstallContext) -> list[str]:
@@ -1347,6 +1405,14 @@ def cleanup_bind_mounts(ctx: InstallContext) -> None:
     for mount_point in ctx.state.get("bind_mounts", []):
         subprocess.run(["umount", mount_point], check=False, capture_output=True)
     ctx.state["bind_mounts"] = []
+
+
+def cleanup_target_hook_masks(ctx: InstallContext) -> None:
+    """Restore the target's deferred boot hooks. Idempotent, and a no-op when
+    nothing was masked, so main()'s finally can call it on any exit path: an
+    interrupt must never leave the installed system with its UKI rebuild hook
+    pointing at /dev/null."""
+    _unmask_mkinitcpio_pacman_hooks(ctx, ctx.target, TARGET_DEFERRED_BOOT_HOOKS)
 
 
 def cleanup_protected_state(ctx: InstallContext) -> None:
