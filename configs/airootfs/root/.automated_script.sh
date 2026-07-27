@@ -57,6 +57,39 @@ if [[ ${OMARCHY_INSTALL_DEBUG:-} == "1" ]]; then
   echo "================================"
 fi
 
+# Warm the page cache for the bundled packages while the user works through the
+# wizard. The install reads ~3GB out of the offline mirror, and pacman consumes
+# it at only ~33MB/s, so on media slower than that the install is read-bound and
+# every byte cached here is a byte it never waits for. On faster media this costs
+# nothing but otherwise-idle bandwidth: the medium is untouched while the user
+# types, and the target disk it writes to later is a different device.
+#
+# Clean page cache only, so the kernel reclaims it under pressure instead of
+# OOMing, and a budget so small machines never evict what was just warmed.
+# Set OMARCHY_NO_PREFETCH=1 to A/B the same ISO with this disabled.
+warm_offline_mirror() {
+  local mirror=/var/cache/omarchy/mirror/offline
+  local budget_kb spent_kb=0 size_kb path
+
+  [[ ${OMARCHY_NO_PREFETCH:-} == 1 ]] && return 0
+  [[ -d $mirror ]] || return 0
+
+  budget_kb=$(($(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo) / 2))
+  ((budget_kb > 262144)) || return 0
+
+  # Largest first: the install reads most of the mirror, so when the budget
+  # cannot cover all of it this still front-loads the bytes that dominate.
+  while read -r size_kb path; do
+    ((spent_kb + size_kb > budget_kb)) && continue
+    cat -- "$path" >/dev/null 2>&1 || true
+    spent_kb=$((spent_kb + size_kb))
+  done < <(du -k "$mirror"/*.pkg.tar.zst 2>/dev/null | sort -rn)
+}
+
+warm_offline_mirror &
+warm_pid=$!
+trap 'kill "$warm_pid" 2>/dev/null' EXIT
+
 cd /root
 ./configurator
 
