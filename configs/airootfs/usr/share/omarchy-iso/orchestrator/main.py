@@ -65,10 +65,14 @@ def main() -> int:
     info(f"Installing Omarchy for {ctx.username} → {ctx.target}")
 
     from .phases_impl import (
+        boost_cpu_governor,
         cleanup_bind_mounts,
         cleanup_protected_state,
         cleanup_target_hook_masks,
+        restore_cpu_governors,
     )
+
+    governors = boost_cpu_governor()
 
     success = False
     try:
@@ -85,6 +89,7 @@ def main() -> int:
         info("Installation complete.")
         return 0
     finally:
+        restore_cpu_governors(governors)
         cleanup_bind_mounts(ctx)
         cleanup_target_hook_masks(ctx)
         if not success:
