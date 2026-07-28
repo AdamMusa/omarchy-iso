@@ -116,6 +116,19 @@ cp "/tmp/$NODE_FILENAME" "$build_cache_dir/airootfs/opt/packages/"
 arch_packages=(linux-t2 git gum jq openssl plymouth python-terminaltexteffects tzupdate omarchy-keyring "$OMARCHY_SETTINGS_PACKAGE" lvm2 cryptsetup parted)
 printf '%s\n' "${arch_packages[@]}" >> "$build_cache_dir/packages.x86_64"
 
+# The live ISO boots linux-t2 (see airootfs/etc/mkinitcpio.d/linux-t2.preset), so
+# stock linux is a second kernel nobody boots: ~147MB of ISO, plus its own archiso
+# initramfs, copied into both the ISO tree and the size-constrained FAT EFI image.
+#
+# It cannot just be deleted — releng's broadcom-wl hard-depends on it, and it is
+# the only releng package that does, so pacman would drag the kernel straight back
+# in. broadcom-wl is a prebuilt module for stock linux and cannot load on the
+# kernel we boot, so it has done nothing since we started booting T2 anyway. The
+# install is entirely offline and the live environment needs no Wi-Fi driver.
+#
+# Anchored so linux-t2 and linux-firmware are untouched.
+sed -i -E '/^(linux|broadcom-wl)$/d' "$build_cache_dir/packages.x86_64"
+
 # Build the offline mirror: everything pacstrap might want during the target
 # install. With --local-source, the omarchy* packages we just built are
 # already in the mirror and we filter them out below. Without it, pacman -Syw
