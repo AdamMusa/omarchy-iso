@@ -1396,6 +1396,40 @@ def _validate_pre_mounted_filesystems(ctx: InstallContext) -> None:
             raise RuntimeError(f"{crypttab} missing LUKS UUID {storage['luks_uuid']}")
 
 
+CPU_SYSFS = Path("/sys/devices/system/cpu")
+
+
+def boost_cpu_governor() -> dict[Path, str]:
+    """Run the live CPUs flat out for the install.
+
+    Package extraction and the UKI build are both CPU-bound, and archiso boots
+    on whatever governor the kernel defaults to. Writing an unsupported
+    governor just fails, so nothing needs probing first, and hosts without
+    cpufreq (most VMs) have no paths at all. Returns the prior governors.
+    """
+    saved: dict[Path, str] = {}
+    for path in sorted(CPU_SYSFS.glob("cpu*/cpufreq/scaling_governor")):
+        try:
+            saved[path] = path.read_text().strip()
+            path.write_text("performance\n")
+        except OSError:
+            saved.pop(path, None)
+
+    if saved:
+        info(f"› CPU governor set to performance ({len(saved)} CPUs)")
+    return saved
+
+
+def restore_cpu_governors(saved: dict[Path, str]) -> None:
+    """Only matters when an install fails and the user keeps using the live
+    environment — a successful one reboots out of it."""
+    for path, governor in saved.items():
+        try:
+            path.write_text(f"{governor}\n")
+        except OSError:
+            continue
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # cleanup_bind_mounts: invoked from main()'s finally so bind mounts get
 # unwound on success, failure, or interrupt. Idempotent.
