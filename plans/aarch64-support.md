@@ -76,9 +76,9 @@ aarch64 has no BIOS — only UEFI. Drop the syslinux path entirely on ARM.
 
 The cleanest cut: keep one `grub.cfg` shared, strip the x86 shell/memtest fragments at build time when `OMARCHY_ARCH=aarch64`. Don't fork the file.
 
-### 6. mkinitcpio preset — `configs/airootfs/etc/mkinitcpio.d/linux.preset`
+### 6. mkinitcpio preset — `configs/airootfs/etc/mkinitcpio.d/linux-t2.preset`
 
-References `vmlinuz-linux-t2` and `initramfs-linux-t2.img` (lines 5, 8). For aarch64, swap to `vmlinuz-linux` / `initramfs-linux.img`. Generate the file at build time from a template, keyed on arch.
+Names `vmlinuz-linux-t2` and `initramfs-linux-t2.img`. The filename is the pkgbase and the alpm hook keys off it, so aarch64 does not rename this file — it simply does not ship it, and releng's own `linux.preset` covers the stock kernel. Drop `linux-t2` from `arch_packages` on aarch64 and the boot entries point at `vmlinuz-linux` / `initramfs-linux.img`.
 
 ### 7. Configurator — `configs/airootfs/root/configurator`
 
@@ -145,7 +145,7 @@ Code:
 - `configs/efiboot/loader/loader.conf` — per-arch default entry
 - `configs/efiboot/loader/entries/01-archiso-x86_64-linux.conf` — generate aarch64 sibling at build time
 - `configs/grub/grub.cfg`, `loopback.cfg` — strip x86-only fragments on aarch64
-- `configs/airootfs/etc/mkinitcpio.d/linux.preset` — template by arch (drop linux-t2 on aarch64)
+- `configs/airootfs/etc/mkinitcpio.d/linux-t2.preset` — omit on aarch64 (drop linux-t2 there; releng's linux.preset covers the stock kernel)
 - `configs/airootfs/root/configurator` — branch archinstall JSON mirror list on `uname -m`; optionally guard lspci T2 probe
 - `.github/workflows/nightly-build.yml` — matrix x86_64/aarch64
 
