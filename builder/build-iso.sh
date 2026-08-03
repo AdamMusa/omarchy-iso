@@ -201,48 +201,49 @@ if ! download_offline_packages; then
   download_offline_packages
 fi
 
-prune_stale_package_versions() {
-  local dir="$1"
-  local pkgfile name version cmp
-  local -a stale=()
-  declare -A newest_file=()
-  declare -A newest_version=()
+# Resolve the exact filenames chosen by the same synced package databases used
+# for the download. Pruning by this transaction (rather than merely keeping the
+# newest version of every cached package name) removes packages that have left
+# the lists or dependency closure, such as an old Electron major version.
+if ! resolved_package_files="$(
+  pacman --config "/configs/pacman-online-${OMARCHY_MIRROR}.conf" --noconfirm \
+    --dbpath /tmp/offlinedb -S --print --print-format '%f' "${all_packages[@]}"
+)"; then
+  echo "ERROR: could not resolve the package files required by the offline mirror" >&2
+  exit 1
+fi
+mapfile -t required_package_files <<< "$resolved_package_files"
 
-  while IFS= read -r pkgfile; do
-    read -r name version < <(pacman -Qp "$pkgfile" 2>/dev/null) || continue
-    [[ -n $name && -n $version ]] || continue
-
-    if [[ -z ${newest_version[$name]+x} ]]; then
-      newest_version[$name]="$version"
-      newest_file[$name]="$pkgfile"
-      continue
-    fi
-
-    cmp=$(vercmp "$version" "${newest_version[$name]}")
-    if (( cmp > 0 )); then
-      stale+=("${newest_file[$name]}")
-      newest_version[$name]="$version"
-      newest_file[$name]="$pkgfile"
-    else
-      stale+=("$pkgfile")
-    fi
-  done < <(find "$dir" -maxdepth 1 -type f -name '*.pkg.tar.*' ! -name '*.sig' -print | sort)
-
-  if (( ${#stale[@]} > 0 )); then
-    echo "Pruning stale package versions from offline mirror:"
-    for pkgfile in "${stale[@]}"; do
-      echo "  $(basename "$pkgfile")"
-      rm -f "$pkgfile" "$pkgfile.sig"
+# The online transaction intentionally excludes packages built from the local
+# checkouts. Add those exact artifacts back to the keep-set after verifying
+# that the local build left exactly one file for each selected package name.
+if [[ -n ${LOCAL_OMARCHY_BUILD:-} ]]; then
+  for local_package_name in \
+    "$OMARCHY_RUNTIME_PACKAGE" "$OMARCHY_SETTINGS_PACKAGE" "$OMARCHY_NVIM_PACKAGE"; do
+    local_package_file=""
+    for candidate in "$offline_mirror_dir/$local_package_name-"*.pkg.tar.*; do
+      [[ -f $candidate && $candidate != *.sig ]] || continue
+      read -r candidate_name _ < <(pacman -Qp "$candidate" 2>/dev/null) || continue
+      [[ $candidate_name == "$local_package_name" ]] || continue
+      if [[ -n $local_package_file ]]; then
+        echo "ERROR: multiple local builds found for $local_package_name" >&2
+        exit 1
+      fi
+      local_package_file="${candidate##*/}"
     done
-  fi
-}
+    if [[ -z $local_package_file ]]; then
+      echo "ERROR: local build not found for $local_package_name" >&2
+      exit 1
+    fi
+    required_package_files+=("$local_package_file")
+  done
+fi
+
+printf '%s\n' "${required_package_files[@]}" |
+  bash /builder/prune-offline-mirror.sh "$offline_mirror_dir"
 
 # Rebuild the offline repo db from scratch so size/checksum/depends entries
-# always reflect the current package files. The persistent cache can contain
-# multiple versions of the same package; repo-add keeps the last one it sees,
-# which is lexical glob order, not version order (e.g. pkgrel -9 can override
-# -15). Prune to one newest version per package before indexing.
-prune_stale_package_versions "$offline_mirror_dir"
+# always reflect only the package files selected for this build.
 rm -f "$offline_mirror_dir"/offline.db* "$offline_mirror_dir"/offline.files*
 repo-add "$offline_mirror_dir/offline.db.tar.gz" "$offline_mirror_dir/"*.pkg.tar.zst
 
