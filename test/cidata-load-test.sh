@@ -88,9 +88,9 @@ write_required_pair
 echo "Jeff" >"$sandbox/media/user_full_name.txt"
 echo "jeff@example.com" >"$sandbox/media/user_email_address.txt"
 echo "false" >"$sandbox/media/user_encrypt_installation.txt"
-echo '["ssh-ed25519 AAAA jeff@host"]' >"$sandbox/media/ssh.json"
+echo 'ssh-ed25519 AAAA jeff@host' >"$sandbox/media/authorized_keys"
 run_load || fail "full file set loads"
-for file in user_configuration.json user_credentials.json user_full_name.txt user_email_address.txt user_encrypt_installation.txt ssh.json; do
+for file in user_configuration.json user_credentials.json user_full_name.txt user_email_address.txt user_encrypt_installation.txt authorized_keys; do
   [[ -f $sandbox/root/$file ]] || fail "full file set copies $file"
 done
 grep -q '^umount ' "$TEST_LOG" || fail "full file set unmounts the drive"
@@ -109,16 +109,16 @@ new_sandbox
 attach_drive cidata
 write_required_pair
 run_load || fail "required pair alone loads"
-[[ ! -e $sandbox/root/ssh.json ]] || fail "required pair alone copies no optional files"
+[[ ! -e $sandbox/root/authorized_keys ]] || fail "required pair alone copies no optional files"
 pass "required pair alone loads without optional files"
 
 # Optional files are copied individually when present.
 new_sandbox
 attach_drive cidata
 write_required_pair
-echo '["ssh-ed25519 AAAA jeff@host"]' >"$sandbox/media/ssh.json"
-run_load || fail "required pair plus ssh.json loads"
-[[ -f $sandbox/root/ssh.json ]] || fail "ssh.json is copied when present"
+echo 'ssh-ed25519 AAAA jeff@host' >"$sandbox/media/authorized_keys"
+run_load || fail "required pair plus authorized_keys loads"
+[[ -f $sandbox/root/authorized_keys ]] || fail "authorized_keys is copied when present"
 [[ ! -e $sandbox/root/user_full_name.txt ]] || fail "absent optional files are not copied"
 pass "present optional files are copied, absent ones skipped"
 
@@ -162,9 +162,9 @@ pass "copy failure falls back and unmounts"
 new_sandbox
 attach_drive cidata
 write_required_pair
-echo '["ssh-ed25519 AAAA jeff@host"]' >"$sandbox/media/ssh.json"
+echo 'ssh-ed25519 AAAA jeff@host' >"$sandbox/media/authorized_keys"
 mkdir "$sandbox/root/user_credentials.json"
 ! run_load 2>/dev/null || fail "partial copy exits non-zero"
 [[ ! -e $sandbox/root/user_configuration.json ]] || fail "partial copy removes what it copied"
-[[ ! -e $sandbox/root/ssh.json ]] || fail "partial copy leaves no ssh.json behind"
+[[ ! -e $sandbox/root/authorized_keys ]] || fail "partial copy leaves no authorized_keys behind"
 pass "partial copy cleans up what it copied"

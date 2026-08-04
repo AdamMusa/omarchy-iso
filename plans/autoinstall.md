@@ -68,11 +68,11 @@ Do not take `manifests/fresh-4-semantic.json` as the authority on any of this. I
   - Look for `/dev/disk/by-label/cidata` then `/dev/disk/by-label/CIDATA`; exit non-zero if neither exists.
   - Mount read-only on a temp mountpoint; exit non-zero if the mount fails.
   - Require both `user_configuration.json` and `user_credentials.json` on the drive — this is the same pair `InstallContext.from_env` treats as mandatory. Missing either means the drive is not an autoinstall drive; unmount and exit non-zero.
-  - Copy the required pair plus, when present, `user_full_name.txt`, `user_email_address.txt`, `user_encrypt_installation.txt`, and `ssh.json` into `/root` with a single `cp`, and exit non-zero if the copy fails — a "loaded" drive with missing inputs would fail the install later with a worse error.
+  - Copy the required pair plus, when present, `user_full_name.txt`, `user_email_address.txt`, `user_encrypt_installation.txt`, and `authorized_keys` into `/root` with a single `cp`, and exit non-zero if the copy fails — a "loaded" drive with missing inputs would fail the install later with a worse error.
   - Unmount before exiting. Leave nothing mounted for the install to trip over.
   - The script takes an optional path prefix so the unit tests can point it at a sandbox; production callers pass nothing.
 - Replace the bare `./configurator` call in `.automated_script.sh` with: run `omarchy-cidata-load`; on success export `OMARCHY_UI_INTERACTIVE=no`, on failure run `./configurator`.
-- Pass `--ssh-keys-file /root/ssh.json` to `omarchy-iso-install` in the dashboard invocation, alongside the existing five flags. Always pass it; the orchestrator no-ops when the file is absent, which keeps the interactive path on the identical command line.
+- Pass `--authorized-keys-file /root/authorized_keys` to `omarchy-iso-install` in the dashboard invocation, alongside the existing five flags. Always pass it; the orchestrator no-ops when the file is absent, which keeps the interactive path on the identical command line.
 
 ### Notes
 - The three text files are optional by construction: `_read_text` in `context.py` returns `""` for a missing path and `encrypt` falls back to false. Do not add stricter checks here than the orchestrator itself applies.
@@ -116,23 +116,23 @@ The dashboard is the only process that owns the visible UI. Suppressing its prom
 - `configs/airootfs/usr/share/omarchy-iso/orchestrator/phases_impl.py`
 
 ### Changes
-- `omarchy-iso-install`: add `--ssh-keys-file` to the arg loop, exporting `OMARCHY_INSTALL_SSH_KEYS_FILE`. Same shape as the five existing flags, ahead of the `unknown arg` catch-all (`:19`).
-- `context.py`: add an `ssh_keys_path: Path | None` field populated from that variable in `from_env`, `None` when unset or when the file does not exist.
+- `omarchy-iso-install`: add `--authorized-keys-file` to the arg loop, exporting `OMARCHY_INSTALL_AUTHORIZED_KEYS_FILE`. Same shape as the five existing flags, ahead of the `unknown arg` catch-all (`:19`).
+- `context.py`: add an `authorized_keys_path: Path | None` field populated from that variable in `from_env`, `None` when unset or when the file does not exist.
 - `phases_impl.py`: add `configure_ssh_access(ctx)`:
-  - Return immediately when `ctx.ssh_keys_path` is `None`.
-  - Parse the file as a JSON array of public key strings; write them one per line to `<target>/home/<user>/.ssh/authorized_keys`.
+  - Return immediately when `ctx.authorized_keys_path` is `None`.
+  - Read the file as sshd's own authorized_keys format, dropping blank lines and # comments; write the keys one per line to `<target>/home/<user>/.ssh/authorized_keys`.
   - `.ssh` at `0700`, `authorized_keys` at `0600`, both owned by the user via `arch-chroot <target> chown -R <user>:<user>`. Do not hardcode uid 1000 as PR #72 did — ask the target for it.
   - `arch-chroot <target> systemctl enable sshd.service`. Works cleanly in the chroot.
   - `arch-chroot <target> ufw allow ssh`. This one exits **non-zero** in a chroot (`ERROR: problem running`) because ufw cannot reach netfilter, but it writes the rule to `/etc/ufw/user.rules` before failing, and that file is what `ufw.service` loads on first boot. So ignore the exit status and assert the rule landed in the file instead. No ufw-presence check: ufw is part of Omarchy's default package set, and the rule assertion already fails loudly if it is somehow missing.
-  - A malformed or empty `ssh.json` must fail the phase loudly. A machine that installs "successfully" and is then unreachable is worse than one that stops with an error on screen.
+  - An `authorized_keys` with no usable keys must fail the phase loudly. A machine that installs "successfully" and is then unreachable is worse than one that stops with an error on screen.
 - `main.py`: register `("Configuring SSH access", configure_ssh_access)` in `build_phases` after `configure_login` (`:52`) and before `validate_boot`.
 
 ### Model to follow
 `configure_login` (`phases_impl.py:1251`) — direct writes against `ctx.target`, `arch-chroot` reserved for ownership and `systemctl`. Match its structure.
 
 ### Acceptance criteria
-- Install with `ssh.json`: `ssh <user>@<vm>` works with the corresponding private key on first boot, no password.
-- Install without `ssh.json`: phase runs, does nothing, install unaffected; `~/.ssh` is not created.
+- Install with `authorized_keys`: `ssh <user>@<vm>` works with the corresponding private key on first boot, no password.
+- Install without `authorized_keys`: phase runs, does nothing, install unaffected; `~/.ssh` is not created.
 - `authorized_keys` is `0600` and owned by the install user, not root.
 - Port 22 is open in ufw on the installed system. Test this by connecting, not by reading the phase log — the rule is written from a chroot that cannot verify it.
 - Password SSH auth is left at the distro default — autoinstall does not enable it.
@@ -147,7 +147,7 @@ The dashboard is the only process that owns the visible UI. Suppressing its prom
 
 ### Changes
 - New "Autoinstall" section covering: what the `cidata` drive is, the file table, how to produce the drive, and a Proxmox `qm create` example with disk-first boot order so the empty disk falls through to the ISO on the first boot and boots the installed system afterward.
-- Show `openssl passwd -6` for the credential hash and the `ssh.json` array format.
+- Show `openssl passwd -6` for the credential hash and the `authorized_keys` format.
 - State plainly that the config files are the configurator's own output — the documented way to get a starting `user_configuration.json` is to run one interactive install and copy what it wrote.
 - Do not repeat PR #72's networking claims. NetworkManager comes enabled with DHCP on a stock install; sshd ships disabled, which is why the SSH phase exists.
 
@@ -168,7 +168,7 @@ The dashboard is the only process that owns the visible UI. Suppressing its prom
 ### Negative tests
 - Drive labeled `cidata` with no files → configurator runs.
 - Drive with `user_configuration.json` only → configurator runs.
-- Malformed `ssh.json` → install stops in the remote-access phase with a visible error, does not reboot into an unreachable machine.
+- An `authorized_keys` with no usable keys → install stops in the remote-access phase with a visible error, does not reboot into an unreachable machine.
 - Install failure under autoinstall (e.g. a disk target that does not exist) → failure screen renders, process exits non-zero, no hang.
 
 ### Regression surface

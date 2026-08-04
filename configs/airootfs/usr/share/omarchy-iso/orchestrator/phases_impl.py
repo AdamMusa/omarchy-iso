@@ -22,7 +22,6 @@ Phase ordering (full-disk and protected/pre-mounted):
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
 import shutil
@@ -1314,10 +1313,10 @@ def configure_login(ctx: InstallContext) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def configure_ssh_access(ctx: InstallContext) -> None:
-    if ctx.ssh_keys_path is None:
+    if ctx.authorized_keys_path is None:
         return
 
-    keys = _authorized_keys(ctx.ssh_keys_path)
+    keys = _authorized_keys(ctx.authorized_keys_path)
     info(f"› installing {len(keys)} SSH key(s) for {ctx.username}")
 
     ssh_dir = ctx.target / "home" / ctx.username / ".ssh"
@@ -1362,21 +1361,20 @@ def configure_ssh_access(ctx: InstallContext) -> None:
 
 
 def _authorized_keys(path: Path) -> list[str]:
-    """Parse the autoinstall ssh.json: a JSON array of public key strings.
+    """Read the autoinstall authorized_keys: sshd's own format, one public key
+    per line, with blank lines and # comments dropped.
 
     Raise rather than skip on anything unusable. An install that "succeeds"
     into a machine nobody can log into is worse than one that stops with the
     reason on screen.
     """
     try:
-        keys = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"{path} is not readable JSON: {exc}") from exc
+        lines = path.read_text().splitlines()
+    except OSError as exc:
+        raise RuntimeError(f"{path} is not readable: {exc}") from exc
 
-    if not isinstance(keys, list) or not all(isinstance(key, str) for key in keys):
-        raise RuntimeError(f"{path} must be a JSON array of public key strings")
-
-    keys = [key.strip() for key in keys if key.strip()]
+    keys = [line.strip() for line in lines]
+    keys = [key for key in keys if key and not key.startswith("#")]
     if not keys:
         raise RuntimeError(f"{path} contains no SSH keys")
 

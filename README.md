@@ -37,25 +37,25 @@ These are the configurator's own output files, so the way to get a starting set 
 | `user_full_name.txt` | No | Git full name |
 | `user_email_address.txt` | No | Git email |
 | `user_encrypt_installation.txt` | No | `true` when `user_configuration.json` carries a `disk_encryption` block; defaults to false |
-| `ssh.json` | No | JSON array of SSH public keys |
+| `authorized_keys` | No | SSH public keys in sshd's own format, one per line |
 
 Both required files must be present or the installer falls back to the configurator. Generate the password hash for `user_credentials.json` with `openssl passwd -6 "yourpassword"`.
 
 Encryption itself is configured by the `disk_encryption` block inside `user_configuration.json` — which carries the passphrase in plaintext, so treat a drive built from an encrypted install accordingly. The flag file must match it: it drives the encrypted install's SDDM autologin and the final boot validation, not the encryption.
 
-`ssh.json` is a JSON array of public keys:
+`authorized_keys` is the same file sshd reads — copy your own or write one key per line:
 
-```json
-["ssh-ed25519 AAAA... you@host"]
+```
+ssh-ed25519 AAAA... you@host
 ```
 
-When `ssh.json` is present, autoinstall writes the keys to the user's `~/.ssh/authorized_keys`, enables `sshd`, and adds a `ufw allow ssh` rule — a stock Omarchy install ships openssh with the service disabled and its firewall opens neither port 22 nor anything else beyond LocalSend. Networking needs nothing extra; NetworkManager is already enabled with DHCP. Password SSH authentication is left at the distro default. An unparseable or empty `ssh.json` fails the install rather than producing a machine nobody can reach.
+When `authorized_keys` is present, autoinstall installs it as the user's `~/.ssh/authorized_keys`, enables `sshd`, and adds a `ufw allow ssh` rule — a stock Omarchy install ships openssh with the service disabled and its firewall opens neither port 22 nor anything else beyond LocalSend. Networking needs nothing extra; NetworkManager is already enabled with DHCP. Password SSH authentication is left at the distro default. An `authorized_keys` with no usable keys fails the install rather than producing a machine nobody can reach.
 
 ### Building the drive
 
 ```bash
 mkdir cidata
-cp user_configuration.json user_credentials.json ssh.json cidata/
+cp user_configuration.json user_credentials.json authorized_keys cidata/
 genisoimage -output cidata.iso -volid cidata -joliet -rock cidata/
 ```
 

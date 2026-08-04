@@ -5,7 +5,6 @@ the tests run it against a temp directory with subprocess.run recorded and the
 ufw side effect (writing user.rules) simulated by the fake.
 """
 
-import json
 import stat
 import sys
 import tempfile
@@ -56,12 +55,12 @@ class ConfigureSshAccessTest(unittest.TestCase):
             return CompletedProcess(cmd, 1)
         return CompletedProcess(cmd, 0)
 
-    def ctx(self, ssh_keys=None, ssh_keys_text=None):
-        ssh_keys_path = None
-        if ssh_keys is not None or ssh_keys_text is not None:
-            ssh_keys_path = self.target / "ssh.json"
-            ssh_keys_path.write_text(ssh_keys_text if ssh_keys_text is not None else json.dumps(ssh_keys))
-        return types.SimpleNamespace(target=self.target, username="jeff", ssh_keys_path=ssh_keys_path)
+    def ctx(self, authorized_keys=None):
+        authorized_keys_path = None
+        if authorized_keys is not None:
+            authorized_keys_path = self.target / "authorized_keys"
+            authorized_keys_path.write_text(authorized_keys)
+        return types.SimpleNamespace(target=self.target, username="jeff", authorized_keys_path=authorized_keys_path)
 
     def configure(self, **kwargs):
         phases_impl.configure_ssh_access(self.ctx(**kwargs))
@@ -72,42 +71,47 @@ class ConfigureSshAccessTest(unittest.TestCase):
     def chrooted(self, program):
         return [cmd for cmd in self.calls if cmd[:2] == ["arch-chroot", str(self.target)] and cmd[2] == program]
 
-    def test_no_ssh_json_is_a_no_op(self):
+    def test_no_authorized_keys_is_a_no_op(self):
         self.configure()
         self.assertEqual(self.calls, [])
         self.assertFalse((self.target / "home" / "jeff" / ".ssh").exists())
 
-    def test_writes_keys_one_per_line(self):
-        self.configure(ssh_keys=["ssh-ed25519 AAAA jeff@host", "ssh-rsa BBBB jeff@work"])
+    def test_installs_keys_one_per_line(self):
+        self.configure(authorized_keys="ssh-ed25519 AAAA jeff@host\nssh-rsa BBBB jeff@work\n")
         self.assertEqual(self.authorized_keys().read_text(), "ssh-ed25519 AAAA jeff@host\nssh-rsa BBBB jeff@work\n")
 
-    def test_strips_whitespace_and_drops_blank_entries(self):
-        self.configure(ssh_keys=["  ssh-ed25519 AAAA jeff@host\n", "", "   "])
+    def test_drops_blank_lines_and_comments(self):
+        self.configure(authorized_keys="# work laptop\n\n  ssh-ed25519 AAAA jeff@host  \n")
         self.assertEqual(self.authorized_keys().read_text(), "ssh-ed25519 AAAA jeff@host\n")
 
+    def test_keys_with_options_pass_through(self):
+        key = 'command="/usr/bin/true",no-pty ssh-ed25519 AAAA jeff@host'
+        self.configure(authorized_keys=f"{key}\n")
+        self.assertEqual(self.authorized_keys().read_text(), f"{key}\n")
+
     def test_ssh_dir_is_private(self):
-        self.configure(ssh_keys=["ssh-ed25519 AAAA jeff@host"])
+        self.configure(authorized_keys="ssh-ed25519 AAAA jeff@host\n")
         mode = stat.S_IMODE((self.target / "home" / "jeff" / ".ssh").stat().st_mode)
         self.assertEqual(mode, 0o700)
 
     def test_authorized_keys_is_private(self):
-        self.configure(ssh_keys=["ssh-ed25519 AAAA jeff@host"])
+        self.configure(authorized_keys="ssh-ed25519 AAAA jeff@host\n")
         self.assertEqual(stat.S_IMODE(self.authorized_keys().stat().st_mode), 0o600)
 
     def test_chowns_ssh_dir_to_the_user(self):
-        self.configure(ssh_keys=["ssh-ed25519 AAAA jeff@host"])
+        self.configure(authorized_keys="ssh-ed25519 AAAA jeff@host\n")
         self.assertEqual(self.chrooted("chown"), [
             ["arch-chroot", str(self.target), "chown", "-R", "jeff:jeff", "/home/jeff/.ssh"],
         ])
 
     def test_enables_sshd(self):
-        self.configure(ssh_keys=["ssh-ed25519 AAAA jeff@host"])
+        self.configure(authorized_keys="ssh-ed25519 AAAA jeff@host\n")
         self.assertEqual(self.chrooted("systemctl"), [
             ["arch-chroot", str(self.target), "systemctl", "enable", "sshd.service"],
         ])
 
     def test_allows_ssh_through_ufw_despite_chroot_exit_status(self):
-        self.configure(ssh_keys=["ssh-ed25519 AAAA jeff@host"])
+        self.configure(authorized_keys="ssh-ed25519 AAAA jeff@host\n")
         self.assertEqual(self.chrooted("ufw"), [
             ["arch-chroot", str(self.target), "ufw", "allow", "ssh"],
         ])
@@ -115,27 +119,19 @@ class ConfigureSshAccessTest(unittest.TestCase):
     def test_fails_when_ufw_does_not_record_the_rule(self):
         self.ufw_writes_rule = False
         with self.assertRaisesRegex(RuntimeError, "allow rule for port 22"):
-            self.configure(ssh_keys=["ssh-ed25519 AAAA jeff@host"])
+            self.configure(authorized_keys="ssh-ed25519 AAAA jeff@host\n")
 
-    def test_malformed_json_fails_the_phase(self):
-        with self.assertRaisesRegex(RuntimeError, "not readable JSON"):
-            self.configure(ssh_keys_text="not json")
-
-    def test_non_array_json_fails_the_phase(self):
-        with self.assertRaisesRegex(RuntimeError, "JSON array of public key strings"):
-            self.configure(ssh_keys={"key": "ssh-ed25519 AAAA"})
-
-    def test_non_string_entries_fail_the_phase(self):
-        with self.assertRaisesRegex(RuntimeError, "JSON array of public key strings"):
-            self.configure(ssh_keys=["ssh-ed25519 AAAA jeff@host", 42])
-
-    def test_empty_key_list_fails_the_phase(self):
+    def test_empty_file_fails_the_phase(self):
         with self.assertRaisesRegex(RuntimeError, "contains no SSH keys"):
-            self.configure(ssh_keys=[])
+            self.configure(authorized_keys="")
 
-    def test_blank_only_key_list_fails_the_phase(self):
+    def test_blank_only_file_fails_the_phase(self):
         with self.assertRaisesRegex(RuntimeError, "contains no SSH keys"):
-            self.configure(ssh_keys=["", "  "])
+            self.configure(authorized_keys="\n   \n")
+
+    def test_comment_only_file_fails_the_phase(self):
+        with self.assertRaisesRegex(RuntimeError, "contains no SSH keys"):
+            self.configure(authorized_keys="# no keys here\n")
 
 
 class OptionalPathTest(unittest.TestCase):
@@ -144,7 +140,7 @@ class OptionalPathTest(unittest.TestCase):
 
         self.assertIsNone(_optional_path(None))
         self.assertIsNone(_optional_path(""))
-        self.assertIsNone(_optional_path("/does/not/exist/ssh.json"))
+        self.assertIsNone(_optional_path("/does/not/exist/authorized_keys"))
 
     def test_existing_path_is_returned(self):
         from orchestrator.context import _optional_path
