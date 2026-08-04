@@ -90,40 +90,11 @@ warm_offline_mirror &
 warm_pid=$!
 trap 'kill "$warm_pid" 2>/dev/null' EXIT
 
-# Autoinstall: a drive labeled cidata (the cloud-init NoCloud label, so Proxmox,
-# libvirt and Packer all know how to attach one) carrying the configurator's own
-# output stands in for the wizard. Copy those files into /root and everything
-# downstream runs the ordinary path against ordinary inputs.
-#
-# The required pair is the same one the orchestrator treats as mandatory; the
-# rest are optional there too, so don't be stricter here. Anything less than the
-# pair means this isn't an autoinstall drive, and we fall back to the wizard.
-load_cidata() {
-  local device="" label mnt=/run/cidata
-
-  for label in cidata CIDATA; do
-    [[ -e /dev/disk/by-label/$label ]] && { device=/dev/disk/by-label/$label; break; }
-  done
-  [[ -n $device ]] || return 1
-
-  mkdir -p "$mnt"
-  mount -o ro "$device" "$mnt" || return 1
-
-  if [[ -f $mnt/user_configuration.json && -f $mnt/user_credentials.json ]]; then
-    cp "$mnt"/user_configuration.json "$mnt"/user_credentials.json /root/
-    for file in user_full_name.txt user_email_address.txt user_encrypt_installation.txt ssh.json; do
-      [[ -f $mnt/$file ]] && cp "$mnt/$file" /root/
-    done
-    umount "$mnt"
-    return 0
-  fi
-
-  umount "$mnt"
-  return 1
-}
-
 cd /root
-if load_cidata; then
+# Autoinstall: a cidata drive carrying the configurator's own output files
+# stands in for the wizard. omarchy-cidata-load copies them into /root and
+# everything downstream runs the ordinary path against ordinary inputs.
+if /usr/local/bin/omarchy-cidata-load; then
   echo "Autoinstall configuration found on cidata drive; skipping the configurator."
   export OMARCHY_UI_INTERACTIVE=no
 else
