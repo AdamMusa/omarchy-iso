@@ -1343,25 +1343,15 @@ def configure_ssh_access(ctx: InstallContext) -> None:
         check=True,
     )
 
-    _allow_ssh_through_firewall(ctx)
-
-
-def _allow_ssh_through_firewall(ctx: InstallContext) -> None:
-    """Open port 22 in the target's ufw.
-
-    Omarchy's install/config/firewall.sh opens LocalSend and docker DNS and
-    nothing else, and ufw runs default-deny incoming, so an enabled sshd is
-    still unreachable -- connections time out rather than being refused.
-
-    ufw cannot reach netfilter from inside the chroot and exits non-zero saying
-    so, but it writes the rule to user.rules first, and that file is what
-    ufw.service loads on first boot. So the exit status is the wrong thing to
-    check here; the rule landing in the file is the thing that matters.
-    """
-    if not (ctx.target / "usr" / "bin" / "ufw").exists():
-        info("› no ufw in target, leaving firewall alone")
-        return
-
+    # Open port 22 in the target's ufw, which runs default-deny incoming, so an
+    # enabled sshd is still unreachable -- connections time out rather than
+    # being refused.
+    #
+    # ufw cannot reach netfilter from inside the chroot and exits non-zero
+    # saying so, but it writes the rule to user.rules first, and that file is
+    # what ufw.service loads on first boot. So the exit status is the wrong
+    # thing to check here; the rule landing in the file is the thing that
+    # matters.
     info("› allowing SSH through ufw")
     subprocess.run(["arch-chroot", str(ctx.target), "ufw", "allow", "ssh"], check=False)
 
