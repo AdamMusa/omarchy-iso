@@ -11,12 +11,13 @@ set -eEo pipefail
 # doesn't choke on flags it doesn't recognize.
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --config)           export OMARCHY_INSTALL_CONFIG="$2"; shift 2 ;;
-    --creds)            export OMARCHY_INSTALL_CREDS="$2"; shift 2 ;;
-    --full-name-file)   export OMARCHY_INSTALL_FULL_NAME_FILE="$2"; shift 2 ;;
-    --email-file)       export OMARCHY_INSTALL_EMAIL_FILE="$2"; shift 2 ;;
-    --encrypt-file)     export OMARCHY_INSTALL_ENCRYPT_FILE="$2"; shift 2 ;;
-    *)                  echo "omarchy-iso-install: unknown arg $1" >&2; exit 2 ;;
+    --config)               export OMARCHY_INSTALL_CONFIG="$2"; shift 2 ;;
+    --creds)                export OMARCHY_INSTALL_CREDS="$2"; shift 2 ;;
+    --full-name-file)       export OMARCHY_INSTALL_FULL_NAME_FILE="$2"; shift 2 ;;
+    --email-file)           export OMARCHY_INSTALL_EMAIL_FILE="$2"; shift 2 ;;
+    --encrypt-file)         export OMARCHY_INSTALL_ENCRYPT_FILE="$2"; shift 2 ;;
+    --authorized-keys-file) export OMARCHY_INSTALL_AUTHORIZED_KEYS_FILE="$2"; shift 2 ;;
+    *)                      echo "omarchy-iso-install: unknown arg $1" >&2; exit 2 ;;
   esac
 done
 

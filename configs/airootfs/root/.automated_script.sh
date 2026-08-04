@@ -91,7 +91,15 @@ warm_pid=$!
 trap 'kill "$warm_pid" 2>/dev/null' EXIT
 
 cd /root
-./configurator
+# Autoinstall: a cidata drive carrying the configurator's own output files
+# stands in for the wizard. omarchy-cidata-load copies them into /root and
+# everything downstream runs the ordinary path against ordinary inputs.
+if /usr/local/bin/omarchy-cidata-load; then
+  echo "Autoinstall configuration found on cidata drive; skipping the configurator."
+  export OMARCHY_UI_INTERACTIVE=no
+else
+  ./configurator
+fi
 
 # The foreground dashboard is now the sole visible install UI owner. It starts
 # the actual installer as a non-interactive child, logs child output, waits for
@@ -107,4 +115,5 @@ rm -f /run/omarchy-install/state.json
     --creds /root/user_credentials.json \
     --full-name-file /root/user_full_name.txt \
     --email-file /root/user_email_address.txt \
-    --encrypt-file /root/user_encrypt_installation.txt
+    --encrypt-file /root/user_encrypt_installation.txt \
+    --authorized-keys-file /root/authorized_keys

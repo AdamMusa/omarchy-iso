@@ -1,0 +1,13 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+
+for test in "$ROOT"/test/*-test.sh; do
+  printf '==> %s\n' "${test#$ROOT/}"
+  bash "$test"
+done
+
+printf '==> test/test_*.py\n'
+python3 -m unittest discover -t "$ROOT" -s "$ROOT/test"

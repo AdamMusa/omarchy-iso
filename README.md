@@ -20,9 +20,70 @@ Despite the local folder name, the first argument is the Omarchy source checkout
 
 Use `--dev` or `--rc` to build against those package channels. Both `--dev` and `--edge` select the dev packages from the edge mirror.
 
+## Autoinstall
+
+The shipped ISO installs itself with no keyboard when it finds its configuration on a second drive. Attach a drive labeled `cidata` alongside the ISO and the installer copies the config off it and skips the configurator; with no such drive, nothing changes and the wizard runs as usual. No rebuild, no extra boot entry.
+
+`cidata` is the cloud-init `NoCloud` label, so Proxmox, libvirt, and Packer already know how to attach one.
+
+### Configuration files
+
+These are the configurator's own output files, so the way to get a starting set is to run one interactive install and copy what it wrote into `/root`.
+
+| File | Required | Purpose |
+|------|----------|---------|
+| `user_configuration.json` | Yes | archinstall config: disk, hostname, timezone, keyboard |
+| `user_credentials.json` | Yes | Username and password hash |
+| `user_full_name.txt` | No | Git full name |
+| `user_email_address.txt` | No | Git email |
+| `user_encrypt_installation.txt` | No | `true` when `user_configuration.json` carries a `disk_encryption` block; defaults to false |
+| `authorized_keys` | No | SSH public keys in sshd's own format, one per line |
+
+Both required files must be present or the installer falls back to the configurator. Generate the password hash for `user_credentials.json` with `openssl passwd -6 "yourpassword"`.
+
+Encryption itself is configured by the `disk_encryption` block inside `user_configuration.json` — which carries the passphrase in plaintext, so treat a drive built from an encrypted install accordingly. The flag file must match it: it drives the encrypted install's SDDM autologin and the final boot validation, not the encryption.
+
+`authorized_keys` is the same file sshd reads — copy your own or write one key per line:
+
+```
+ssh-ed25519 AAAA... you@host
+```
+
+When `authorized_keys` is present, autoinstall installs it as the user's `~/.ssh/authorized_keys`, enables `sshd`, and adds a `ufw allow ssh` rule — a stock Omarchy install ships openssh with the service disabled and its firewall opens neither port 22 nor anything else beyond LocalSend. Networking needs nothing extra; NetworkManager is already enabled with DHCP. Password SSH authentication is left at the distro default. An `authorized_keys` with no usable keys fails the install rather than producing a machine nobody can reach.
+
+### Building the drive
+
+```bash
+mkdir cidata
+cp user_configuration.json user_credentials.json authorized_keys cidata/
+genisoimage -output cidata.iso -volid cidata -joliet -rock cidata/
+```
+
+### Proxmox example
+
+```bash
+qm create 101 --name my-omarchy \
+  --bios ovmf --machine q35 --cpu host --cores 4 --memory 8192 \
+  --ostype l26 --scsihw virtio-scsi-single \
+  --efidisk0 local-lvm:0,efitype=4m,pre-enrolled-keys=0 \
+  --scsi0 local-lvm:40,discard=on,iothread=1 \
+  --net0 virtio,bridge=vmbr0 --vga virtio --serial0 socket \
+  --ide2 local:iso/omarchy.iso,media=cdrom \
+  --ide3 local:iso/cidata.iso,media=cdrom \
+  --boot order='scsi0;ide2'
+
+qm start 101
+```
+
+Boot order is disk first: the empty disk falls through to the ISO on the first boot, and the installed system boots from disk afterwards. The machine reboots into Omarchy on its own when the install finishes.
+
+Encrypted autoinstalls are not fully unattended — the LUKS passphrase prompt still needs someone at the first boot.
+
 ## Testing the ISO
 
 Run `./bin/omarchy-iso-boot [release/omarchy.iso]`.
+
+Run `./test/all` for the unit tests, which cover cidata autoinstall loading and the orchestrator's SSH access phase without needing a built ISO.
 
 To exercise installation alongside existing Windows-style partitions, run
 `./bin/omarchy-iso-test-windows-disk [release/omarchy.iso]`. It creates a
