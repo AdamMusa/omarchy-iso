@@ -57,22 +57,26 @@ Do not take `manifests/fresh-4-semantic.json` as the authority on any of this. I
 
 ## 1) Detect the cidata drive and skip the configurator
 
-### File
+### Files
+- `configs/airootfs/usr/local/bin/omarchy-cidata-load`
 - `configs/airootfs/root/.automated_script.sh`
+- `configs/profiledef.sh`
 
 ### Changes
-- Add a `load_cidata` function above the existing `cd /root` (`:93`):
-  - Look for `/dev/disk/by-label/cidata` then `/dev/disk/by-label/CIDATA`; return non-zero if neither exists.
-  - Mount read-only on a temp mountpoint; return non-zero if the mount fails.
-  - Require both `user_configuration.json` and `user_credentials.json` on the drive — this is the same pair `InstallContext.from_env` treats as mandatory. Missing either means the drive is not an autoinstall drive; unmount and return non-zero.
-  - Copy the required pair plus, when present, `user_full_name.txt`, `user_email_address.txt`, `user_encrypt_installation.txt`, and `ssh.json` into `/root`.
-  - Unmount before returning. Leave nothing mounted for the install to trip over.
-- Replace the bare `./configurator` call (`:94`) with: run `load_cidata`; on success export `OMARCHY_UI_INTERACTIVE=no`, on failure run `./configurator`.
-- Pass `--ssh-keys-file /root/ssh.json` to `omarchy-iso-install` in the dashboard invocation (`:101`–`:110`), alongside the existing five flags. Always pass it; the orchestrator no-ops when the file is absent, which keeps the interactive path on the identical command line.
+- Add `omarchy-cidata-load` alongside the other install commands in `/usr/local/bin` (with the matching `file_permissions` entry in `profiledef.sh`). It exits 0 when an autoinstall drive was loaded:
+  - `udevadm settle` first: the by-label symlinks come from udev, and probing before enumeration finishes would silently drop a headless install into the wizard.
+  - Look for `/dev/disk/by-label/cidata` then `/dev/disk/by-label/CIDATA`; exit non-zero if neither exists.
+  - Mount read-only on a temp mountpoint; exit non-zero if the mount fails.
+  - Require both `user_configuration.json` and `user_credentials.json` on the drive — this is the same pair `InstallContext.from_env` treats as mandatory. Missing either means the drive is not an autoinstall drive; unmount and exit non-zero.
+  - Copy the required pair plus, when present, `user_full_name.txt`, `user_email_address.txt`, `user_encrypt_installation.txt`, and `ssh.json` into `/root` with a single `cp`, and exit non-zero if the copy fails — a "loaded" drive with missing inputs would fail the install later with a worse error.
+  - Unmount before exiting. Leave nothing mounted for the install to trip over.
+  - The script takes an optional path prefix so the unit tests can point it at a sandbox; production callers pass nothing.
+- Replace the bare `./configurator` call in `.automated_script.sh` with: run `omarchy-cidata-load`; on success export `OMARCHY_UI_INTERACTIVE=no`, on failure run `./configurator`.
+- Pass `--ssh-keys-file /root/ssh.json` to `omarchy-iso-install` in the dashboard invocation, alongside the existing five flags. Always pass it; the orchestrator no-ops when the file is absent, which keeps the interactive path on the identical command line.
 
 ### Notes
 - The three text files are optional by construction: `_read_text` in `context.py` returns `""` for a missing path and `encrypt` falls back to false. Do not add stricter checks here than the orchestrator itself applies.
-- `load_cidata` must not run before `warm_offline_mirror` is backgrounded — the mirror warm should keep its head start.
+- `omarchy-cidata-load` must not run before `warm_offline_mirror` is backgrounded — the mirror warm should keep its head start.
 
 ### Acceptance criteria
 - ISO with no `cidata` drive attached: configurator runs, byte-identical UX to today.
@@ -119,7 +123,7 @@ The dashboard is the only process that owns the visible UI. Suppressing its prom
   - Parse the file as a JSON array of public key strings; write them one per line to `<target>/home/<user>/.ssh/authorized_keys`.
   - `.ssh` at `0700`, `authorized_keys` at `0600`, both owned by the user via `arch-chroot <target> chown -R <user>:<user>`. Do not hardcode uid 1000 as PR #72 did — ask the target for it.
   - `arch-chroot <target> systemctl enable sshd.service`. Works cleanly in the chroot.
-  - `arch-chroot <target> ufw allow ssh` when the target has ufw. This one exits **non-zero** in a chroot (`ERROR: problem running`) because ufw cannot reach netfilter, but it writes the rule to `/etc/ufw/user.rules` before failing, and that file is what `ufw.service` loads on first boot. So ignore the exit status and assert the rule landed in the file instead.
+  - `arch-chroot <target> ufw allow ssh`. This one exits **non-zero** in a chroot (`ERROR: problem running`) because ufw cannot reach netfilter, but it writes the rule to `/etc/ufw/user.rules` before failing, and that file is what `ufw.service` loads on first boot. So ignore the exit status and assert the rule landed in the file instead. No ufw-presence check: ufw is part of Omarchy's default package set, and the rule assertion already fails loudly if it is somehow missing.
   - A malformed or empty `ssh.json` must fail the phase loudly. A machine that installs "successfully" and is then unreachable is worse than one that stops with an error on screen.
 - `main.py`: register `("Configuring SSH access", configure_ssh_access)` in `build_phases` after `configure_login` (`:52`) and before `validate_boot`.
 
@@ -145,11 +149,14 @@ The dashboard is the only process that owns the visible UI. Suppressing its prom
 - New "Autoinstall" section covering: what the `cidata` drive is, the file table, how to produce the drive, and a Proxmox `qm create` example with disk-first boot order so the empty disk falls through to the ISO on the first boot and boots the installed system afterward.
 - Show `openssl passwd -6` for the credential hash and the `ssh.json` array format.
 - State plainly that the config files are the configurator's own output — the documented way to get a starting `user_configuration.json` is to run one interactive install and copy what it wrote.
-- Do not repeat PR #72's networking claims. Say that sshd and NetworkManager come enabled on a stock install and that autoinstall only adds the key.
+- Do not repeat PR #72's networking claims. NetworkManager comes enabled with DHCP on a stock install; sshd ships disabled, which is why the SSH phase exists.
 
 ---
 
 ## 5) Validation
+
+### Unit tests
+`./test/all` runs everything under `test/`: `cidata-load-test.sh` exercises `omarchy-cidata-load` against a sandbox with `mount`/`umount`/`udevadm` stubbed, and `test_configure_ssh_access.py` runs the orchestrator phase against a temp target with `subprocess.run` recorded and ufw's write-the-rule-then-fail chroot behavior simulated. The Python tests run through `unittest` discovery alongside the repo's existing `test_*.py` suites.
 
 ### Manual matrix
 1. Build the ISO from this branch.
@@ -165,7 +172,7 @@ The dashboard is the only process that owns the visible UI. Suppressing its prom
 - Install failure under autoinstall (e.g. a disk target that does not exist) → failure screen renders, process exits non-zero, no hang.
 
 ### Regression surface
-The interactive path shares every line of this change except the `load_cidata` branch, so run the standard acceptance harness (`./bin/omarchy-iso-test`) on the built ISO before proposing the PR.
+The interactive path shares every line of this change except the `omarchy-cidata-load` branch, so run the standard acceptance harness (`./bin/omarchy-iso-test`) on the built ISO before proposing the PR.
 
 ---
 

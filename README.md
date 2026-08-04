@@ -36,10 +36,12 @@ These are the configurator's own output files, so the way to get a starting set 
 | `user_credentials.json` | Yes | Username and password hash |
 | `user_full_name.txt` | No | Git full name |
 | `user_email_address.txt` | No | Git email |
-| `user_encrypt_installation.txt` | No | `true` to encrypt the install; defaults to false |
+| `user_encrypt_installation.txt` | No | `true` when `user_configuration.json` carries a `disk_encryption` block; defaults to false |
 | `ssh.json` | No | JSON array of SSH public keys |
 
 Both required files must be present or the installer falls back to the configurator. Generate the password hash for `user_credentials.json` with `openssl passwd -6 "yourpassword"`.
+
+Encryption itself is configured by the `disk_encryption` block inside `user_configuration.json` — which carries the passphrase in plaintext, so treat a drive built from an encrypted install accordingly. The flag file must match it: it drives the encrypted install's SDDM autologin and the final boot validation, not the encryption.
 
 `ssh.json` is a JSON array of public keys:
 
@@ -80,6 +82,8 @@ Encrypted autoinstalls are not fully unattended — the LUKS passphrase prompt s
 ## Testing the ISO
 
 Run `./bin/omarchy-iso-boot [release/omarchy.iso]`.
+
+Run `./test/all` for the unit tests, which cover cidata autoinstall loading and the orchestrator's SSH access phase without needing a built ISO.
 
 To exercise installation alongside existing Windows-style partitions, run
 `./bin/omarchy-iso-test-windows-disk [release/omarchy.iso]`. It creates a
