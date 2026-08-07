@@ -1,224 +1,163 @@
-# OEM Install + First-Boot Setup Plan
+# OEM Install + Factory Reset Plan
 
 ## Goal
 
-Create a second ISO flavor for OEM preloading that is installed to internal storage at factory time, then boots into customer setup on first power-on (no external media required), and ends in a fully encrypted Omarchy install.
+An install mode that installs the entire system but defers user account setup to
+first boot. On first power-on the machine asks for the user, creates it, and
+lands in the already-installed system — the classic OEM out-of-box experience.
+The same machinery doubles as a "reset computer" option for wiping a machine
+before selling it.
 
-## Product Requirements
+## Core idea: "OEM state" as a first-class system state
 
-- Factory can preload one image to internal disk.
-- Customer first boot launches setup flow automatically (already works: `.automated_script.sh` runs configurator on tty1).
-- Customer chooses credentials/settings.
-- Final installed OS uses full-disk encryption (LUKS) with customer password (already works: configurator collects password and passes it to archinstall as `encryption_password`).
-- Existing consumer ISO behavior remains unchanged.
+Define one canonical state — *fully installed, no user, setup pending* — and
+make both paths produce it:
 
----
+- **ISO OEM mode** ends the install in OEM state instead of creating the user.
+- **Reset** returns a running machine to OEM state.
 
-## Chosen Architecture
+OEM state is: a fully installed system plus `/var/lib/omarchy/oem/` containing:
 
-### Bootstrapping model
-- OEM devices ship with an OEM bootstrap ISO image written to internal disk.
-- On first boot, `copytoram=y` kernel arg loads the live environment into RAM, freeing the internal disk.
-- Bootstrap environment launches existing configurator + installer.
-- Installer performs a fresh install to internal disk with LUKS encryption enabled.
-- Bootstrap environment is overwritten during install.
+| File | Purpose |
+|------|---------|
+| `pending` | Flag that arms the first-boot setup service |
+| `packages/node-v*.tar.gz` | Node tarball copied off the ISO's `/opt/packages` (~30MB) so `omarchy-finalize-user` works offline at first boot |
+| `groups` | Deferred `usermod -aG` groups written by system setup (see below) |
+| `luks-key` | Throwaway LUKS passphrase for encrypted installs, staged for auto-unlock until first-boot re-key |
 
-### Recovery model: zero-recovery
-- No permanent recovery partition.
-- Simplest and strongest security story.
-- Recovery requires external reinstall media.
+## Why the seam is nearly clean already
 
----
+Everything in the orchestrator through `finalize_limine_boot` is
+user-independent except five touch points:
 
-## Non-Goals
+1. `installer.create_users` — useradd + password (root gets the same password).
+2. Three `usermod -aG` calls inside `omarchy-setup-system`'s scripts
+   (`config/docker.sh`, `hardware/input-group.sh`, `hardware/apple/fix-t2.sh` —
+   docker/input/video). This is the *only* reason `omarchy-setup-system`
+   requires the user to exist (its getent check).
+3. `run_chroot_finalizer` → `omarchy-finalize-user` as the user. Already
+   offline-safe: `/etc/skel` does the heavy seeding at useradd time,
+   `omarchy-mise-install` writes lazy wrappers, and the only external artifact
+   is the bundled Node tarball from `/opt/packages` (`install/user/mise.sh`).
+4. `configure_login` — SDDM `state.conf` and the encrypted-install autologin.
+5. Encryption — the user's password *is* the LUKS passphrase.
 
-- No on-device recovery workflow.
-- No changes to normal installer UX outside explicit OEM mode checks and warnings.
-- No factory credential provisioning.
+Nothing in hardware setup, Limine, hibernation, snapper, or package
+installation cares who the user is.
 
----
+## First boot: `omarchy-oem-setup.service`
 
-## Repo Implementation Plan
+Ships in the omarchy runtime package (so reset can arm it without the ISO):
 
-## 1) Add OEM build mode
+- `ConditionPathExists=/var/lib/omarchy/oem/pending`
+- `Before=display-manager.service`, conflicts `getty@tty1`, TUI on tty1.
+- Runs the user form extracted from the configurator (Step 2: username,
+  password, full name, email). The configurator is bash+gum, so the form moves
+  into a runtime-shipped `omarchy-oem-setup` script that reuses the exact ISO
+  look (logo, Tokyo Night VT palette).
 
-### Files
-- `bin/omarchy-iso-make`
-- `builder/build-iso.sh`
+Then it does what the ISO would have done:
 
-### Changes
-- Add CLI flag `--oem` to `bin/omarchy-iso-make`.
-- Pass `OMARCHY_MODE=oem` into Docker build env (default `normal`).
-- In `builder/build-iso.sh`, write mode marker `/root/omarchy_mode` containing `oem` or `normal` (same pattern as `omarchy_mirror`).
-- Keep OEM on current boot stack (`uefi.grub` + `bios.syslinux`); do not add or depend on systemd-boot paths.
-- When `OMARCHY_MODE=oem`, inject `copytoram=y` into all shipped OEM boot entry points before `mkarchiso` runs:
-  - `grub/grub.cfg`: append to `linux` cmdline entries.
-  - `grub/loopback.cfg`: append to `linux` cmdline entries.
-  - `syslinux/archiso_sys-linux.cfg`: append to `APPEND` lines.
-- When `OMARCHY_MODE=oem`, remove accessibility/speakup boot entries:
-  - `grub/grub.cfg`: remove `archlinux-accessibility` menuentry.
-  - `grub/loopback.cfg`: remove `archlinux-accessibility` menuentry.
-  - `syslinux/archiso_sys-linux.cfg`: remove `arch64speech` label block.
-- When `OMARCHY_MODE=oem`, override `iso_application` in `profiledef.sh` to `"Omarchy OEM Installer"`.
-- Rename output ISO with `-oem` suffix (in addition to existing `-$OMARCHY_ISO_REF` suffix).
+1. `useradd` with wheel + the groups from `/var/lib/omarchy/oem/groups`,
+   set user + root password.
+2. `omarchy-finalize-user` as the user, with a setup context that points at the
+   stashed Node tarball (a sibling of the existing `iso-chroot` context).
+3. The `configure_login` writes: SDDM `state.conf`, autologin for encrypted
+   installs.
+4. If `luks-key` exists: `cryptsetup luksChangeKey` to the user's password,
+   delete the stash, remove the auto-unlock keyfile, rebuild initramfs.
+5. Git identity from the form (the `OMARCHY_USER_NAME`/`OMARCHY_USER_EMAIL`
+   path in `install/user/git.sh`).
+6. Remove `/var/lib/omarchy/oem/`, hand off to SDDM.
 
-### Hardening
-- Add post-injection build assertion that fails build if any expected boot config does not contain `copytoram=y`.
-- Add post-injection build assertion that fails build if any OEM boot config still contains accessibility/speakup entries.
-- Make injection idempotent (do not duplicate `copytoram=y` if already present).
+The user lands in their session exactly like a normal install.
 
-### Acceptance criteria
-- `./bin/omarchy-iso-make --oem` builds successfully.
-- OEM ISO boot entries contain `copytoram=y` in all supported boot paths.
-- OEM ISO does not expose accessibility/speakup boot entries.
-- Normal build output and behavior remain unchanged.
+## Encryption: keep it, Pop!_OS-style
 
-### Suggested verification commands
-- `bsdtar -xOf out/<iso>.iso boot/grub/grub.cfg | rg copytoram=y`
-- `bsdtar -xOf out/<iso>.iso boot/grub/loopback.cfg | rg copytoram=y`
-- `bsdtar -xOf out/<iso>.iso boot/syslinux/archiso_sys-linux.cfg | rg copytoram=y`
-- `bsdtar -xOf out/<iso>.iso boot/grub/grub.cfg | rg 'accessibility|speakup'` (should return no matches)
-- `bsdtar -xOf out/<iso>.iso boot/syslinux/archiso_sys-linux.cfg | rg 'speech|accessibility'` (should return no matches)
+Do not force OEM installs unencrypted. Install encrypted with a generated
+throwaway passphrase, stage a keyfile so boot auto-unlocks during the OEM
+window, and have first-boot setup re-key to the user's chosen password
+(step 4 above). Limine and mkinitcpio don't care what the passphrase is. This
+preserves encrypted-by-default without the machine builder ever knowing the end
+user's password.
 
----
+## ISO-side changes (this repo)
 
-## 2) Add OEM safety guardrails
+- **Configurator**: an OEM choice in the install-mode step that skips Step 2
+  (user), plus a cidata `oem` marker file that replaces the
+  `user_credentials.json` requirement — that's what actual OEM imaging rigs
+  will use via autoinstall.
+- **Orchestrator**: `oem: true` in the `omarchy_install` JSON. Swaps the three
+  user phases (`create_users` inside `arch_install_system`,
+  `run_chroot_finalizer`, the user parts of `configure_login`) for a
+  "stage OEM state" phase that writes `/var/lib/omarchy/oem/` and enables
+  `omarchy-oem-setup.service` in the target. `InstallContext.username` needs an
+  OEM-safe fallback (creds are absent).
+- **Factory snapshot**: at the end of *every* install (not just OEM), take a
+  read-only snapshot of `@` kept at the top level as `@factory` — outside
+  snapper's `.snapshots`, so cleanup timers and the Limine snapshot menu never
+  touch it. Zero bytes at creation; grows only with drift. This is what makes
+  reset a true factory reset.
 
-### Why
-OEM image boots from internal disk and later wipes that same disk. Live environment must be fully in RAM before install begins.
+## Runtime-side changes (omarchy repo)
 
-### File
-- `configs/airootfs/root/.automated_script.sh`
+- `omarchy-oem-setup` + `omarchy-oem-setup.service` (the OOBE above).
+- `omarchy-reset-computer` (below).
+- Relax `omarchy-setup-system`: when the install user doesn't exist yet, the
+  three `usermod -aG` scripts append to `/var/lib/omarchy/oem/groups` instead
+  of failing the getent check.
 
-### Changes
-- Before `run_configurator`, if `/root/omarchy_mode` is `oem`:
-  - Verify `/proc/cmdline` contains `copytoram=y`; abort with clear actionable error if missing.
-  - Verify factory hardware minimum using `MemTotal`:
-    - Require `MemTotal >= 8 GiB`.
-    - Abort with clear error if below minimum.
-  - Verify runtime memory safety using `MemAvailable`:
-    - Minimum threshold: `1.5 x ISO size + 1 GiB`.
-    - Abort with clear error if below threshold.
-  - Verify runtime state indicates live root is in RAM (for example, expected archiso runtime mounts present and boot media not actively mounted as install target path).
+## Reset: `omarchy-reset-computer`
 
-### Acceptance criteria
-- OEM mode aborts safely if `copytoram=y` missing from cmdline.
-- OEM mode aborts safely if `MemTotal < 8 GiB`.
-- OEM mode aborts safely if `MemAvailable` below threshold.
-- OEM mode aborts safely if runtime state does not confirm RAM-backed live environment.
+Behind a very explicit confirmation (typed, not y/n):
 
-### Error message requirements
-- State exactly what failed.
-- State why install is blocked.
-- Provide next step (reboot using proper OEM media or use external recovery media).
+1. Point the default subvolume at a writable snapshot of `@factory`; stage a
+   next-boot wipe unit.
+2. On reboot: recreate `@home` (subvolume delete/create — instant, no rm -rf),
+   clear `@log`, delete snapper snapshots, reset machine-id, SSH host keys,
+   NetworkManager connections, Tailscale state, SDDM state; run `fstrim`.
+3. Re-arm OEM state: `pending` flag, `groups`, Node tarball (kept from install
+   or re-fetched into `@factory` at install time), and on encrypted machines a
+   throwaway LUKS re-key — the buyer never needs the seller's passphrase.
 
----
+Next boot is the same OOBE as a fresh OEM install. User-installed packages and
+/etc drift are gone, which is what "wipe and sell" actually promises.
 
-## 3) OEM disk warning
+Machines installed before `@factory` existed get a degraded reset — keep the
+current system, wipe users/state only — with that caveat surfaced in the
+confirmation.
 
-### Why
-With `copytoram=y`, archiso copies squashfs to RAM and releases boot device. Existing configurator call `findmnt -no SOURCE /run/archiso/bootmnt` may return empty, so exclusion filter is skipped and all physical disks are shown, including former boot disk. No disk selection logic change is required.
+### Honest limitations (document these)
 
-OEM mode still needs an unmistakable warning before destructive install proceeds.
+- On unencrypted disks this is deletion, not forensic erasure. `fstrim` helps
+  on SSDs; offer `cryptsetup reencrypt` or `blkdiscard` + reinstall for the
+  paranoid.
+- `luksChangeKey` changes the passphrase but not the volume key; freed extents
+  remain readable to someone with raw-device access and the new passphrase.
+  Same remedy as above.
+- A reset machine boots with day-one packages until it updates — same as a
+  fresh install.
 
-### File
-- `configs/airootfs/root/configurator`
+## Sequencing
 
-### Changes
-- Read mode from `/root/omarchy_mode`.
-- If mode is `oem`, add OEM-specific warning text before existing destructive confirmation.
-- Upgrade confirmation in OEM mode to explicit typed confirmation (for example: `YES, WIPE DISK`) while preserving existing normal-mode flow.
+The OOBE lives in the omarchy runtime package, but the ISO's OEM phase depends
+on it existing. So:
 
-### Acceptance criteria
-- Normal ISO behavior is unchanged.
-- OEM ISO shows OEM-specific warning before disk wipe confirmation.
-- OEM typed confirmation is required before destructive action.
-- In VM with `copytoram=y`, former boot disk appears in disk list without exclusion-logic changes.
+1. Ship the runtime side first (`omarchy-oem-setup`, service, reset command,
+   `omarchy-setup-system` relaxation).
+2. ISO OEM mode then asserts the service file exists in the target before
+   offering the mode.
+3. Factory snapshot can land with either half; reset requires both.
 
----
+## Validation
 
-## 4) Documentation
-
-### File
-- `README.md`
-
-### Changes
-- Document `--oem` build flag and resulting artifact naming.
-- Document factory workflow: writing OEM ISO to internal disk and expected first-boot UX.
-- Document failure and recovery behavior:
-  - Missing `copytoram=y`, `MemTotal < 8 GiB`, or low `MemAvailable` causes safe abort.
-  - Interrupted/failed install requires external reinstall media.
-- Add short operator checklist for manufacturing line validation.
-
----
-
-## 5) Validation
-
-### VM test matrix
-1. Build OEM ISO.
-2. Write OEM ISO to virtual disk (not external media emulation).
-3. Boot from virtual disk and verify:
-   - `/proc/cmdline` contains `copytoram=y`.
-   - Guardrail checks pass in healthy case.
-   - OEM boot menu does not include accessibility/speech entries.
-4. Complete setup flow on first boot.
-5. Install to same disk.
-6. Reboot into installed OS.
-7. Verify encryption:
-   - `lsblk` shows crypt mapping.
-   - `cryptsetup status` reports active LUKS device.
-   - Boot requires unlock passphrase.
-8. Validate OEM warning + typed confirmation appears and gates destructive action.
-
-### Boot path coverage
-- UEFI + GRUB path.
-- BIOS/syslinux path (if still shipped).
-
-### Hardware test matrix
-- UEFI test on at least two hardware families (Intel + AMD).
-- Confirm no external media required.
-- Confirm first boot starts setup automatically.
-
-### Negative tests
-- OEM boot without `copytoram=y` -> safe abort with clear error.
-- `MemTotal < 8 GiB` -> safe abort with clear error.
-- Low `MemAvailable` -> safe abort with clear error.
-- Runtime state not RAM-backed -> safe abort with clear error.
-- Power interruption before installer starts -> deterministic reboot behavior.
-- Power interruption during install -> recovery requires external media (documented).
-
----
-
-## 6) Security hardening checklist
-
-- No factory credentials exist; customer sets all passwords at first boot.
-- Clear shell history and transient setup artifacts at end of install.
-- Verify no secrets in logs shipped to customer.
-- Regenerate host identity on first installed boot as needed:
-  - `machine-id`
-  - SSH host keys (if installed/enabled)
-- Keep package signature verification and keyring handling intact.
-
----
-
-## Rollout Plan
-
-1. Implement OEM build flag, mode marker, boot config injection, and build assertions.
-2. Implement copytoram, memory, and runtime-state guardrails in `.automated_script.sh`.
-3. Add OEM warning text and typed destructive confirmation in configurator.
-4. Add docs and operator checklist.
-5. Run VM matrix, including negative tests.
-6. Run hardware matrix.
-7. Cut first OEM preproduction release for manufacturing pilot.
-
----
-
-## Definition of Done
-
-- `--oem` build exists and is documented.
-- Device preloaded with OEM image boots directly to setup.
-- Setup installs to internal disk without external media.
-- Final installed system is LUKS-encrypted with customer-owned passphrase.
-- OEM safety guardrails fail closed with actionable errors.
-- Existing non-OEM ISO behavior remains unchanged.
-- VM and hardware QA matrix pass.
+- VM: OEM install (encrypted + unencrypted) → reboot → OOBE → session; verify
+  LUKS passphrase is the user's, throwaway key gone, groups applied,
+  `omarchy-finalize-user` state marker present.
+- VM: normal install → use system → `omarchy-reset-computer` → OOBE as new
+  user; verify no trace of prior user (home, NM connections, tailscale,
+  machine-id, host keys, snapper snapshots).
+- Autoinstall: cidata drive with `oem` marker and no credentials → unattended
+  OEM install.
+- Negative: OEM ISO built against a runtime package lacking the service fails
+  the install with a clear error, not a user-less boot loop.
