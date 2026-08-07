@@ -89,8 +89,9 @@ echo "Jeff" >"$sandbox/media/user_full_name.txt"
 echo "jeff@example.com" >"$sandbox/media/user_email_address.txt"
 echo "false" >"$sandbox/media/user_encrypt_installation.txt"
 echo 'ssh-ed25519 AAAA jeff@host' >"$sandbox/media/authorized_keys"
+echo 'tskey-auth-kFAKEKEY' >"$sandbox/media/tailscale_authkey"
 run_load || fail "full file set loads"
-for file in user_configuration.json user_credentials.json user_full_name.txt user_email_address.txt user_encrypt_installation.txt authorized_keys; do
+for file in user_configuration.json user_credentials.json user_full_name.txt user_email_address.txt user_encrypt_installation.txt authorized_keys tailscale_authkey; do
   [[ -f $sandbox/root/$file ]] || fail "full file set copies $file"
 done
 grep -q '^umount ' "$TEST_LOG" || fail "full file set unmounts the drive"
@@ -120,6 +121,7 @@ echo 'ssh-ed25519 AAAA jeff@host' >"$sandbox/media/authorized_keys"
 run_load || fail "required pair plus authorized_keys loads"
 [[ -f $sandbox/root/authorized_keys ]] || fail "authorized_keys is copied when present"
 [[ ! -e $sandbox/root/user_full_name.txt ]] || fail "absent optional files are not copied"
+[[ ! -e $sandbox/root/tailscale_authkey ]] || fail "absent tailscale_authkey is not copied"
 pass "present optional files are copied, absent ones skipped"
 
 # Half the required pair is not an autoinstall drive: unmount and fall back.

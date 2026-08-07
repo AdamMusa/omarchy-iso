@@ -116,4 +116,5 @@ rm -f /run/omarchy-install/state.json
     --full-name-file /root/user_full_name.txt \
     --email-file /root/user_email_address.txt \
     --encrypt-file /root/user_encrypt_installation.txt \
-    --authorized-keys-file /root/authorized_keys
+    --authorized-keys-file /root/authorized_keys \
+    --tailscale-authkey-file /root/tailscale_authkey

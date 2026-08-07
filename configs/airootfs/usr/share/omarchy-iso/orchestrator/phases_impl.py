@@ -16,6 +16,7 @@ Phase ordering (full-disk and protected/pre-mounted):
     run_chroot_finalizer   → arch-chroot -u user omarchy-finalize-user
     configure_login        → sddm state + encrypted-install autologin
     configure_ssh_access   → authorized_keys for autoinstall; no-op otherwise
+    configure_tailscale    → tailnet join staged for first boot; no-op otherwise
     validate_boot          → assert UKI / limine.conf / kernel cmdline are sane
 """
 
@@ -290,6 +291,14 @@ def arch_install_system(ctx: InstallContext) -> None:
 
             info("› installing Omarchy runtime + omarchy-base.packages")
             installer.add_additional_packages(_runtime_package_list(ctx))
+
+            # Tailscale is bundled in the offline mirror but only installed
+            # when an autoinstall drive staged an auth key; must happen here,
+            # while the mirror is still bind-mounted, not in the phase that
+            # configures the join.
+            if ctx.tailscale_authkey_path is not None:
+                info("› installing tailscale (auth key staged for first boot)")
+                installer.add_additional_packages(["tailscale"])
         finally:
             _unmask_mkinitcpio_pacman_hooks(ctx)
             _unmount_offline_package_cache(ctx)
@@ -1379,6 +1388,113 @@ def _authorized_keys(path: Path) -> list[str]:
         raise RuntimeError(f"{path} contains no SSH keys")
 
     return keys
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# configure_tailscale: stage the tailnet join an autoinstall drive asked for.
+# `tailscale up` needs a running tailscaled and there is no systemd in the
+# chroot, so the install only stages: the key, the enabled services, and a
+# oneshot first-boot unit that performs the join once the network is really
+# there. The package itself was installed from the offline mirror during
+# arch_install_system -- nothing is fetched at boot.
+# ─────────────────────────────────────────────────────────────────────────────
+
+TAILSCALE_AUTHKEY_TARGET = "/etc/tailscale/authkey"
+
+# systemd expands $VAR in ExecStart, so the retry loop avoids `$` entirely.
+# network-online.target can be reached before there is real connectivity, so
+# retry inside the boot; TimeoutStartSec bounds it. ExecStartPost only runs
+# after ExecStart succeeds, which gives the retry-across-boots behavior for
+# free: on failure the key stays and the unit stays enabled, so a machine
+# installed offline joins on the first boot that has connectivity. On success
+# the key is removed and the unit never runs again.
+TAILSCALE_JOIN_UNIT = f"""\
+[Unit]
+Description=Join the tailnet with the auth key staged by autoinstall
+Wants=network-online.target
+After=network-online.target tailscaled.service
+Requires=tailscaled.service
+ConditionPathExists={TAILSCALE_AUTHKEY_TARGET}
+
+[Service]
+Type=oneshot
+TimeoutStartSec=10min
+ExecStart=/usr/bin/sh -c 'until tailscale up --auth-key file:{TAILSCALE_AUTHKEY_TARGET}; do sleep 10; done'
+ExecStartPost=/usr/bin/rm -f {TAILSCALE_AUTHKEY_TARGET}
+ExecStartPost=/usr/bin/systemctl disable omarchy-tailscale-join.service
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def configure_tailscale(ctx: InstallContext) -> None:
+    if ctx.tailscale_authkey_path is None:
+        return
+
+    key = _tailscale_authkey(ctx.tailscale_authkey_path)
+
+    # An ISO built before tailscale was bundled installs nothing, and a staged
+    # key with no binary would fail silently forever on first boot.
+    if not (ctx.target / "usr" / "bin" / "tailscale").exists():
+        raise RuntimeError("tailscale is not installed on the target; this ISO does not bundle it")
+
+    info("› staging Tailscale auth key")
+    ts_dir = ctx.target / "etc" / "tailscale"
+    ts_dir.mkdir(parents=True, exist_ok=True)
+    ts_dir.chmod(0o700)
+    authkey = ts_dir / "authkey"
+    authkey.write_text(f"{key}\n")
+    authkey.chmod(0o600)
+
+    info("› enabling tailscaled and the first-boot join")
+    unit = ctx.target / "etc" / "systemd" / "system" / "omarchy-tailscale-join.service"
+    unit.parent.mkdir(parents=True, exist_ok=True)
+    unit.write_text(TAILSCALE_JOIN_UNIT)
+    subprocess.run(
+        ["arch-chroot", str(ctx.target), "systemctl", "enable",
+         "tailscaled.service", "omarchy-tailscale-join.service"],
+        check=True,
+    )
+
+    # Same dance as configure_ssh_access: ufw cannot reach netfilter from the
+    # chroot and exits non-zero, but it records the rule in user.rules first,
+    # and that file is what ufw.service loads on first boot. Without the rule
+    # the node joins the tailnet and is then unreachable over it.
+    info("› allowing tailnet traffic through ufw")
+    subprocess.run(
+        ["arch-chroot", str(ctx.target), "ufw", "allow", "in", "on", "tailscale0"],
+        check=False,
+    )
+
+    rules = ctx.target / "etc" / "ufw" / "user.rules"
+    text = rules.read_text() if rules.exists() else ""
+    if "-i tailscale0 -j ACCEPT" not in text:
+        raise RuntimeError(f"ufw did not record an allow rule for tailscale0 in {rules}")
+
+
+def _tailscale_authkey(path: Path) -> str:
+    """Read the autoinstall tailscale_authkey: exactly one key, with blank
+    lines and # comments dropped. No format validation beyond that -- key
+    formats are Tailscale's to change.
+
+    Raise rather than skip on anything unusable, same reasoning as
+    _authorized_keys: a machine that "succeeds" into never joining the
+    tailnet is worse than one that stops with the reason on screen.
+    """
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as exc:
+        raise RuntimeError(f"{path} is not readable: {exc}") from exc
+
+    keys = [line.strip() for line in lines]
+    keys = [key for key in keys if key and not key.startswith("#")]
+    if not keys:
+        raise RuntimeError(f"{path} contains no auth key")
+    if len(keys) > 1:
+        raise RuntimeError(f"{path} contains {len(keys)} keys; expected exactly one")
+
+    return keys[0]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
