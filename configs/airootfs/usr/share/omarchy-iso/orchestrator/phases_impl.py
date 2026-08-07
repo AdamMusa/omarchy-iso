@@ -1169,9 +1169,11 @@ NODE_PACKAGES_DIR = Path("/opt/packages")
 
 
 def stage_oem_state(ctx: InstallContext) -> None:
+    # World-readable: first-boot finalization reads the Node tarball as the
+    # new user. The only secret inside (luks-key) is itself 0600 root.
     oem_dir = ctx.target / OEM_STATE_DIR
     oem_dir.mkdir(parents=True, exist_ok=True)
-    oem_dir.chmod(0o700)
+    oem_dir.chmod(0o755)
 
     _stage_node_tarball(ctx, oem_dir)
 

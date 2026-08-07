@@ -293,6 +293,28 @@ type_text() {
       :) press shift-semicolon ;;
       @) press shift-2 ;;
       \|) press shift-backslash ;;
+      ";") press semicolon ;;
+      "'") press apostrophe ;;
+      '"') press shift-apostrophe ;;
+      "=") press equal ;;
+      "+") press shift-equal ;;
+      "%") press shift-5 ;;
+      "&") press shift-7 ;;
+      "*") press shift-8 ;;
+      "(") press shift-9 ;;
+      ")") press shift-0 ;;
+      "<") press shift-comma ;;
+      ">") press shift-dot ;;
+      "!") press shift-1 ;;
+      "#") press shift-3 ;;
+      '$') press shift-4 ;;
+      "?") press shift-slash ;;
+      "~") press shift-grave_accent ;;
+      "\\") press backslash ;;
+      "[") press bracket_left ;;
+      "]") press bracket_right ;;
+      "{") press shift-bracket_left ;;
+      "}") press shift-bracket_right ;;
       *) echo "type_text: unsupported character: $ch" >&2; return 1 ;;
     esac
     sleep 0.05
@@ -673,7 +695,7 @@ drive_oem_setup() {
   capture_console "success-oem-02-password"
   press ret
 
-  wait_for_screen "match the password" 60
+  wait_for_screen "Confirm" 60
   type_text "$GUEST_PASSWORD"
   press ret
 
