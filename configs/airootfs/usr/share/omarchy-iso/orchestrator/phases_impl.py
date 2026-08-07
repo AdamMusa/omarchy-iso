@@ -1403,11 +1403,14 @@ TAILSCALE_AUTHKEY_TARGET = "/etc/tailscale/authkey"
 
 # systemd expands $VAR in ExecStart, so the retry loop avoids `$` entirely.
 # network-online.target can be reached before there is real connectivity, so
-# retry inside the boot; TimeoutStartSec bounds it. ExecStartPost only runs
-# after ExecStart succeeds, which gives the retry-across-boots behavior for
-# free: on failure the key stays and the unit stays enabled, so a machine
-# installed offline joins on the first boot that has connectivity. On success
-# the key is removed and the unit never runs again.
+# retry inside the boot -- but NOT as a oneshot: target units implicitly gain
+# After= for their Wants=, so a oneshot in multi-user.target holds the whole
+# boot (SDDM included) hostage until it finishes. Type=simple counts as
+# started the moment it forks, letting boot proceed while the join retries in
+# the background for as long as the boot lasts. Cleanup lives inside the
+# script because it must only run after a successful join: the key is removed
+# and the unit disabled on success, while on a boot with no connectivity both
+# survive -- so a machine installed offline joins on the first boot that can.
 TAILSCALE_JOIN_UNIT = f"""\
 [Unit]
 Description=Join the tailnet with the auth key staged by autoinstall
@@ -1417,11 +1420,8 @@ Requires=tailscaled.service
 ConditionPathExists={TAILSCALE_AUTHKEY_TARGET}
 
 [Service]
-Type=oneshot
-TimeoutStartSec=10min
-ExecStart=/usr/bin/sh -c 'until tailscale up --auth-key file:{TAILSCALE_AUTHKEY_TARGET}; do sleep 10; done'
-ExecStartPost=/usr/bin/rm -f {TAILSCALE_AUTHKEY_TARGET}
-ExecStartPost=/usr/bin/systemctl disable omarchy-tailscale-join.service
+Type=simple
+ExecStart=/usr/bin/sh -c 'until tailscale up --auth-key file:{TAILSCALE_AUTHKEY_TARGET}; do sleep 15; done; rm -f {TAILSCALE_AUTHKEY_TARGET}; systemctl disable omarchy-tailscale-join.service'
 
 [Install]
 WantedBy=multi-user.target

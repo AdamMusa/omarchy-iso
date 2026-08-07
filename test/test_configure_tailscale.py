@@ -100,12 +100,26 @@ class ConfigureTailscaleTest(unittest.TestCase):
     def test_installs_the_join_unit(self):
         self.configure(authkey="tskey-auth-kFAKEKEY\n")
         text = self.unit().read_text()
-        self.assertIn("tailscale up --auth-key file:/etc/tailscale/authkey", text)
         self.assertIn("ConditionPathExists=/etc/tailscale/authkey", text)
-        # The key must not outlive a successful join, and the unit must not
-        # run again after one.
-        self.assertIn("ExecStartPost=/usr/bin/rm -f /etc/tailscale/authkey", text)
-        self.assertIn("ExecStartPost=/usr/bin/systemctl disable omarchy-tailscale-join.service", text)
+        # The key must not outlive a successful join, the unit must not run
+        # again after one, and cleanup must be sequenced after the join
+        # succeeds -- inside the script, not in ExecStartPost.
+        self.assertIn(
+            "ExecStart=/usr/bin/sh -c 'until tailscale up --auth-key file:/etc/tailscale/authkey;"
+            " do sleep 15; done; rm -f /etc/tailscale/authkey;"
+            " systemctl disable omarchy-tailscale-join.service'",
+            text,
+        )
+
+    def test_join_unit_does_not_hold_up_boot(self):
+        # A Type=oneshot wanted by multi-user.target holds the whole boot
+        # (SDDM included) hostage until the join finishes or times out --
+        # target units implicitly gain After= for their Wants=.
+        self.configure(authkey="tskey-auth-kFAKEKEY\n")
+        text = self.unit().read_text()
+        self.assertIn("Type=simple", text)
+        self.assertNotIn("Type=oneshot", text)
+        self.assertNotIn("TimeoutStartSec", text)
 
     def test_unit_avoids_systemd_variable_expansion(self):
         self.configure(authkey="tskey-auth-kFAKEKEY\n")

@@ -40,22 +40,28 @@ offline-capable.
 
 `tailscale up` needs a running tailscaled, and there is no systemd in the
 chroot. So the installer only stages: the key at `/etc/tailscale/authkey`
-(root, `0600`), `tailscaled.service` enabled, and a oneshot
+(root, `0600`), `tailscaled.service` enabled, and an
 `omarchy-tailscale-join.service` that runs `tailscale up --auth-key
 file:/etc/tailscale/authkey` on first boot.
 
 "When the network is available" lives in the unit, not the installer:
 `After=network-online.target` for ordering, plus an in-unit retry loop
-(`until tailscale up …; do sleep 10; done` under `TimeoutStartSec=10min`),
-because network-online can be reached before there is real connectivity.
-The systemd success/failure semantics do the rest for free:
+(`until tailscale up …; do sleep 15; done`), because network-online can be
+reached before there is real connectivity.
 
-- On success, `ExecStartPost` removes the key and disables the unit — the key
-  never outlives the join, and the unit never runs again.
-- On failure (no network, tailscaled not ready, key rejected), ExecStartPost
-  is skipped: the key stays, the unit stays enabled, and the join retries on
-  every boot until it succeeds. A machine installed offline joins whenever it
-  first gets connectivity.
+The unit is `Type=simple`, not oneshot, and that is load-bearing: target
+units implicitly gain `After=` for their `Wants=`, so a oneshot wanted by
+`multi-user.target` holds the whole boot — SDDM included — hostage until the
+join finishes or times out, and once timed out it never retries within that
+boot. (Caught by review.) Type=simple counts as started the moment it forks:
+boot proceeds normally while the join retries in the background for as long
+as the boot lasts.
+
+Cleanup is sequenced inside the script, after `tailscale up` succeeds — the
+key is removed and the unit disables itself, so the key never outlives the
+join and the unit never runs again. On a boot that never gets connectivity
+both survive (`ConditionPathExists` gates re-runs on the key), so a machine
+installed offline joins on the first boot that can.
 
 The machine appears on the tailnet under the hostname from
 `user_configuration.json` — nothing extra to configure.
