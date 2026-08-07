@@ -39,6 +39,7 @@ def build_phases(ctx: InstallContext):
         configure_dns_resolver,
         configure_login,
         configure_ssh_access,
+        configure_tailscale,
         validate_boot,
     )
 
@@ -52,6 +53,7 @@ def build_phases(ctx: InstallContext):
         ("Finalizing user",            run_chroot_finalizer),
         ("Configuring login",          configure_login),
         ("Configuring SSH access",     configure_ssh_access),
+        ("Configuring Tailscale",      configure_tailscale),
         ("Configuring DNS resolver",   configure_dns_resolver),
         ("Validating boot setup",      validate_boot),
     ]

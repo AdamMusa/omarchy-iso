@@ -38,7 +38,7 @@ mount -o ro "$device" "$mnt" || exit 1
 loaded=1
 if [[ -f $mnt/user_configuration.json && -f $mnt/user_credentials.json ]]; then
   files=("$mnt"/user_configuration.json "$mnt"/user_credentials.json)
-  for file in user_full_name.txt user_email_address.txt user_encrypt_installation.txt authorized_keys; do
+  for file in user_full_name.txt user_email_address.txt user_encrypt_installation.txt authorized_keys tailscale_authkey; do
     [[ -f $mnt/$file ]] && files+=("$mnt/$file")
   done
   if cp "${files[@]}" "$dest"/; then
