@@ -304,6 +304,7 @@ type_text() {
 ssh_guest() {
   ssh -i "$SSH_KEY" -p "$SSH_PORT" \
     -o BatchMode=yes \
+    -o IdentitiesOnly=yes \
     -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null \
     -o ConnectTimeout=5 \
@@ -672,7 +673,7 @@ drive_oem_setup() {
   capture_console "success-oem-02-password"
   press ret
 
-  wait_for_screen "Must match" 60
+  wait_for_screen "match the password" 60
   type_text "$GUEST_PASSWORD"
   press ret
 
