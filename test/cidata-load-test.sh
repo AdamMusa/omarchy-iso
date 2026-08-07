@@ -124,6 +124,35 @@ run_load || fail "required pair plus authorized_keys loads"
 [[ ! -e $sandbox/root/tailscale_authkey ]] || fail "absent tailscale_authkey is not copied"
 pass "present optional files are copied, absent ones skipped"
 
+# An oem marker replaces user_credentials.json: OEM installs defer user
+# creation to first boot, so imaging rigs ship no credentials at all.
+new_sandbox
+attach_drive cidata
+echo '{"disk_config": {}}' >"$sandbox/media/user_configuration.json"
+: >"$sandbox/media/oem"
+run_load || fail "config plus oem marker loads"
+[[ -f $sandbox/root/oem ]] || fail "oem marker is copied"
+[[ ! -e $sandbox/root/user_credentials.json ]] || fail "oem drive copies no credentials"
+pass "oem marker stands in for credentials"
+
+# The oem marker and credentials can coexist (rig supplies its own LUKS
+# passphrase in the credentials file); both are copied.
+new_sandbox
+attach_drive cidata
+write_required_pair
+: >"$sandbox/media/oem"
+run_load || fail "oem marker plus credentials loads"
+[[ -f $sandbox/root/oem && -f $sandbox/root/user_credentials.json ]] || fail "both oem marker and credentials are copied"
+pass "oem marker plus credentials copies both"
+
+# An oem marker without the configuration is still not an autoinstall drive.
+new_sandbox
+attach_drive cidata
+: >"$sandbox/media/oem"
+! run_load || fail "oem marker alone is not an autoinstall drive"
+[[ ! -e $sandbox/root/oem ]] || fail "oem marker alone copies nothing"
+pass "oem marker alone falls back to the wizard"
+
 # Half the required pair is not an autoinstall drive: unmount and fall back.
 new_sandbox
 attach_drive cidata

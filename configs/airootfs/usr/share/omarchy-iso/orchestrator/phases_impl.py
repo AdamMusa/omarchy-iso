@@ -1136,14 +1136,138 @@ def _run_target_setup_command(ctx: InstallContext, cmd: list[str], *, user: str 
 
 
 def run_system_finalizer(ctx: InstallContext) -> None:
+    if ctx.oem:
+        cmd = ["/usr/bin/omarchy-setup-system", "--oem", "--first-install"]
+    else:
+        cmd = ["/usr/bin/omarchy-setup-system", "--install-user", ctx.username, "--first-install"]
+
     _mask_mkinitcpio_pacman_hooks(ctx, ctx.target, TARGET_DEFERRED_BOOT_HOOKS)
     try:
-        _run_target_setup_command(
-            ctx,
-            ["/usr/bin/omarchy-setup-system", "--install-user", ctx.username, "--first-install"],
-        )
+        _run_target_setup_command(ctx, cmd)
     finally:
         _unmask_mkinitcpio_pacman_hooks(ctx, ctx.target, TARGET_DEFERRED_BOOT_HOOKS)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# stage_oem_state: produce the on-disk "OEM state" the runtime's first-boot
+# setup (omarchy-oem-setup) and factory reset (omarchy-reset-computer) consume.
+#
+# Every install stashes the bundled Node tarball in /var/lib/omarchy/oem/
+# so a later factory reset can finalize the new owner's user offline. OEM-mode
+# installs additionally arm the first-boot setup service and, on encrypted
+# targets, stage the throwaway LUKS passphrase: the keyfile embedded in the
+# initramfs auto-unlocks boot during the OEM window, and first-boot setup
+# re-keys the volume to the owner's password and removes it.
+#
+# Runs before finalize_limine_boot so the cryptkey cmdline drop-in and the
+# keyfile land in the final UKI build.
+# ─────────────────────────────────────────────────────────────────────────────
+
+OEM_STATE_DIR = "var/lib/omarchy/oem"
+OEM_KEYFILE = "etc/omarchy/oem.key"
+NODE_PACKAGES_DIR = Path("/opt/packages")
+
+
+def stage_oem_state(ctx: InstallContext) -> None:
+    oem_dir = ctx.target / OEM_STATE_DIR
+    oem_dir.mkdir(parents=True, exist_ok=True)
+    oem_dir.chmod(0o700)
+
+    _stage_node_tarball(ctx, oem_dir)
+
+    if not ctx.oem:
+        return
+
+    service_src = ctx.target / "usr/share/omarchy/install/oem/omarchy-oem-setup.service"
+    setup_bin = ctx.target / "usr/bin/omarchy-oem-setup"
+    if not service_src.exists() or not setup_bin.exists():
+        raise RuntimeError(
+            "OEM install requested, but the installed Omarchy runtime does not ship "
+            "first-boot setup (omarchy-oem-setup + install/oem/omarchy-oem-setup.service). "
+            "Update the runtime package this ISO bundles before installing in OEM mode."
+        )
+
+    info("› arming first-boot OEM setup")
+    (oem_dir / "pending").touch()
+
+    unit_dst = ctx.target / "etc/systemd/system/omarchy-oem-setup.service"
+    unit_dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(service_src, unit_dst)
+    wants_dir = ctx.target / "etc/systemd/system/multi-user.target.wants"
+    wants_dir.mkdir(parents=True, exist_ok=True)
+    link = wants_dir / "omarchy-oem-setup.service"
+    link.unlink(missing_ok=True)
+    link.symlink_to("/etc/systemd/system/omarchy-oem-setup.service")
+
+    if _oem_install_encrypted(ctx):
+        _stage_oem_luks_unlock(ctx, oem_dir)
+
+
+def _stage_node_tarball(ctx: InstallContext, oem_dir) -> None:
+    tarballs = sorted(NODE_PACKAGES_DIR.glob("node-v*-linux-x64.tar.gz"))
+    if not tarballs:
+        if ctx.oem:
+            raise RuntimeError(
+                "no bundled Node tarball in /opt/packages — OEM first-boot setup "
+                "could not finalize the user offline"
+            )
+        info("› no bundled Node tarball to stash for factory reset; skipping")
+        return
+
+    packages_dir = oem_dir / "packages"
+    packages_dir.mkdir(parents=True, exist_ok=True)
+    target_tarball = packages_dir / tarballs[0].name
+    if not target_tarball.exists():
+        info("› stashing Node tarball for offline first-boot setup")
+        shutil.copy2(tarballs[0], target_tarball)
+
+
+def _oem_install_encrypted(ctx: InstallContext) -> bool:
+    if _storage_intent(ctx).get("luks_uuid"):
+        return True
+    disk_encryption = (ctx.user_configuration.get("disk_config") or {}).get("disk_encryption")
+    if disk_encryption and disk_encryption.get("encryption_type", "luks") != "no_encryption":
+        return True
+    return ctx.encrypt
+
+
+def _oem_encryption_password(ctx: InstallContext) -> str | None:
+    disk_encryption = (ctx.user_configuration.get("disk_config") or {}).get("disk_encryption") or {}
+    return disk_encryption.get("encryption_password") or ctx.user_credentials.get("encryption_password")
+
+
+def _stage_oem_luks_unlock(ctx: InstallContext, oem_dir) -> None:
+    password = _oem_encryption_password(ctx)
+    if not password:
+        # Full-disk OEM installs get a generated passphrase injected by
+        # InstallContext; only a pre-mounted (rig-partitioned) LUKS target can
+        # land here, and it must hand over the passphrase it formatted with.
+        raise RuntimeError(
+            "OEM install on a pre-encrypted target requires the LUKS passphrase "
+            "in user_credentials.json (encryption_password) so first boot can re-key"
+        )
+
+    info("› staging LUKS auto-unlock for the OEM window")
+
+    # Byte-for-byte the slot passphrase: no trailing newline anywhere.
+    luks_key = oem_dir / "luks-key"
+    luks_key.write_text(password)
+    luks_key.chmod(0o600)
+
+    keyfile = ctx.target / OEM_KEYFILE
+    keyfile.parent.mkdir(parents=True, exist_ok=True)
+    keyfile.write_text(password)
+    keyfile.chmod(0o600)
+
+    cmdline_dropin = ctx.target / "etc/limine-entry-tool.d/99-omarchy-oem-unlock.conf"
+    cmdline_dropin.parent.mkdir(parents=True, exist_ok=True)
+    cmdline_dropin.write_text(
+        'KERNEL_CMDLINE[default]+=" cryptkey=rootfs:/etc/omarchy/oem.key"\n'
+    )
+
+    files_dropin = ctx.target / "etc/mkinitcpio.conf.d/99-omarchy-oem-key.conf"
+    files_dropin.parent.mkdir(parents=True, exist_ok=True)
+    files_dropin.write_text("FILES+=(/etc/omarchy/oem.key)\n")
 
 
 def finalize_limine_boot(ctx: InstallContext) -> None:
@@ -1239,6 +1363,10 @@ def _limine_kernel_cmdline(config_text: str) -> str:
 
 
 def run_chroot_finalizer(ctx: InstallContext) -> None:
+    if ctx.oem:
+        info("› OEM install: user finalization deferred to first boot")
+        return
+
     _run_target_setup_command(
         ctx,
         ["/usr/bin/omarchy-finalize-user", "--force", "--first-install"],
@@ -1285,29 +1413,32 @@ def configure_login(ctx: InstallContext) -> None:
     )
 
     autologin_conf = sddm_dir / "autologin.conf"
-    if ctx.encrypt:
+    if ctx.encrypt and not ctx.oem:
         autologin_conf.write_text(
             "[Autologin]\n"
             f"User={ctx.username}\n"
             "Session=omarchy.desktop\n"
         )
     else:
+        # OEM installs have no user yet; omarchy-oem-setup writes autologin
+        # and SDDM state at first boot once the owner exists.
         autologin_conf.unlink(missing_ok=True)
 
-    state_dir = ctx.target / "var" / "lib" / "sddm"
-    state_dir.mkdir(parents=True, exist_ok=True)
-    (state_dir / "state.conf").write_text(
-        f"[Last]\nSession=omarchy.desktop\nUser={ctx.username}\n"
-    )
+    if not ctx.oem:
+        state_dir = ctx.target / "var" / "lib" / "sddm"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "state.conf").write_text(
+            f"[Last]\nSession=omarchy.desktop\nUser={ctx.username}\n"
+        )
+        subprocess.run(
+            ["arch-chroot", str(ctx.target), "chown", "sddm:sddm",
+             "/var/lib/sddm", "/var/lib/sddm/state.conf"],
+            check=False, capture_output=True,
+        )
 
     autologin = ctx.target / "etc" / "systemd" / "system" / "getty@tty1.service.d" / "autologin.conf"
     autologin.unlink(missing_ok=True)
 
-    subprocess.run(
-        ["arch-chroot", str(ctx.target), "chown", "sddm:sddm",
-         "/var/lib/sddm", "/var/lib/sddm/state.conf"],
-        check=False, capture_output=True,
-    )
     subprocess.run(
         ["arch-chroot", str(ctx.target), "systemctl", "enable", "sddm.service"],
         check=False, capture_output=True,
@@ -1326,24 +1457,36 @@ def configure_ssh_access(ctx: InstallContext) -> None:
         return
 
     keys = _authorized_keys(ctx.authorized_keys_path)
-    info(f"› installing {len(keys)} SSH key(s) for {ctx.username}")
 
-    ssh_dir = ctx.target / "home" / ctx.username / ".ssh"
-    ssh_dir.mkdir(parents=True, exist_ok=True)
-    ssh_dir.chmod(0o700)
+    if ctx.oem:
+        # No user to authorize yet. Stage the keys in OEM state for
+        # omarchy-oem-setup to install once first boot creates the owner, and
+        # still open the door (sshd + ufw) below.
+        info(f"› staging {len(keys)} SSH key(s) for the first-boot user")
+        oem_dir = ctx.target / OEM_STATE_DIR
+        oem_dir.mkdir(parents=True, exist_ok=True)
+        staged = oem_dir / "authorized_keys"
+        staged.write_text("".join(f"{key}\n" for key in keys))
+        staged.chmod(0o600)
+    else:
+        info(f"› installing {len(keys)} SSH key(s) for {ctx.username}")
 
-    authorized_keys = ssh_dir / "authorized_keys"
-    authorized_keys.write_text("".join(f"{key}\n" for key in keys))
-    authorized_keys.chmod(0o600)
+        ssh_dir = ctx.target / "home" / ctx.username / ".ssh"
+        ssh_dir.mkdir(parents=True, exist_ok=True)
+        ssh_dir.chmod(0o700)
 
-    # Ask the target for the uid rather than assuming the first user is 1000.
-    # Uncaptured so a failure shows up in the install log, and checked because
-    # a root-owned authorized_keys is one sshd refuses to read.
-    subprocess.run(
-        ["arch-chroot", str(ctx.target), "chown", "-R",
-         f"{ctx.username}:{ctx.username}", f"/home/{ctx.username}/.ssh"],
-        check=True,
-    )
+        authorized_keys = ssh_dir / "authorized_keys"
+        authorized_keys.write_text("".join(f"{key}\n" for key in keys))
+        authorized_keys.chmod(0o600)
+
+        # Ask the target for the uid rather than assuming the first user is 1000.
+        # Uncaptured so a failure shows up in the install log, and checked because
+        # a root-owned authorized_keys is one sshd refuses to read.
+        subprocess.run(
+            ["arch-chroot", str(ctx.target), "chown", "-R",
+             f"{ctx.username}:{ctx.username}", f"/home/{ctx.username}/.ssh"],
+            check=True,
+        )
 
     info("› enabling sshd")
     subprocess.run(
@@ -1550,6 +1693,34 @@ def validate_boot(ctx: InstallContext) -> None:
     if ctx.is_protected:
         _validate_pre_mounted_filesystems(ctx)
 
+    if ctx.oem:
+        _validate_oem_state(ctx)
+
+
+def _validate_oem_state(ctx: InstallContext) -> None:
+    """An OEM install that boots without a working first-boot setup is a
+    user-less brick; insist the armed state is complete before reboot."""
+    oem_dir = ctx.target / OEM_STATE_DIR
+    if not (oem_dir / "pending").exists():
+        raise RuntimeError(f"OEM install but {oem_dir / 'pending'} is missing")
+
+    link = ctx.target / "etc/systemd/system/multi-user.target.wants/omarchy-oem-setup.service"
+    if not link.is_symlink():
+        raise RuntimeError("OEM install but omarchy-oem-setup.service is not enabled")
+
+    if not list((oem_dir / "packages").glob("node-v*.tar.gz")):
+        raise RuntimeError(f"OEM install but no Node tarball staged in {oem_dir / 'packages'}")
+
+    if _oem_install_encrypted(ctx):
+        for required in (oem_dir / "luks-key", ctx.target / OEM_KEYFILE):
+            if not required.exists():
+                raise RuntimeError(f"encrypted OEM install but {required} is missing")
+        limine_conf_text = (
+            ctx.target / _boot_intent(ctx)["esp_mount"].lstrip("/") / "limine.conf"
+        ).read_text()
+        if "cryptkey=rootfs:" not in limine_conf_text:
+            raise RuntimeError("encrypted OEM install but limine.conf has no cryptkey= for auto-unlock")
+
 
 def _assert_boot_hooks_restored(ctx: InstallContext) -> None:
     """Never hand over a system whose UKI rebuild hook is still masked.
@@ -1605,6 +1776,62 @@ def _validate_pre_mounted_filesystems(ctx: InstallContext) -> None:
             raise RuntimeError(f"{crypttab} missing")
         if storage["luks_uuid"] not in crypttab.read_text():
             raise RuntimeError(f"{crypttab} missing LUKS UUID {storage['luks_uuid']}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# create_factory_snapshot: read-only snapshot of @ kept at the btrfs top level
+# as @factory — outside snapper's .snapshots, so cleanup timers and the Limine
+# snapshot menu never touch it. Zero bytes at creation; grows only with drift.
+# Taken at the end of every install, it is what makes omarchy-reset-computer a
+# true factory reset.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def create_factory_snapshot(ctx: InstallContext) -> None:
+    fstype = _findmnt_value(ctx.target, "FSTYPE")
+    if fstype != "btrfs":
+        info(f"› target root is {fstype or 'unknown'}, not btrfs; skipping factory snapshot")
+        return
+
+    options = (_findmnt_value(ctx.target, "OPTIONS") or "").split(",")
+    if not any(opt in ("subvol=/@", "subvol=@") for opt in options):
+        info("› target root is not the @ subvolume; skipping factory snapshot")
+        return
+
+    device = (_findmnt_value(ctx.target, "SOURCE") or "").split("[")[0]
+    if not device:
+        raise RuntimeError(f"could not determine the btrfs device backing {ctx.target}")
+
+    top = ctx.state_dir / "factory-top"
+    top.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["mount", "-o", "subvolid=5", device, str(top)], check=True)
+    try:
+        root_subvol = top / "@"
+        if not root_subvol.is_dir():
+            raise RuntimeError(f"no @ subvolume at the top level of {device}")
+
+        factory = top / "@factory"
+        if factory.exists():
+            subprocess.run(
+                ["btrfs", "subvolume", "delete", str(factory)],
+                check=True, capture_output=True,
+            )
+
+        info("› snapshotting @ as @factory (read-only)")
+        subprocess.run(
+            ["btrfs", "subvolume", "snapshot", "-r", str(root_subvol), str(factory)],
+            check=True,
+        )
+    finally:
+        subprocess.run(["umount", str(top)], check=False, capture_output=True)
+
+
+def _findmnt_value(path: Path, column: str) -> str | None:
+    res = subprocess.run(
+        ["findmnt", "-no", column, str(path)],
+        capture_output=True, text=True,
+    )
+    value = res.stdout.strip()
+    return value if res.returncode == 0 and value else None
 
 
 CPU_SYSFS = Path("/sys/devices/system/cpu")

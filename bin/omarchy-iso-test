@@ -14,6 +14,8 @@
 # Usage: omarchy-iso-test [release/omarchy.iso] [options]
 #
 #   --encrypt          Drive the encrypted install flow (default: unencrypted)
+#   --oem              Drive the OEM install flow: no user during install, the
+#                      first boot runs omarchy-oem-setup and creates it there
 #   --reuse-base       Skip the install phase if a base image already exists
 #   --install-only     Stop after producing the installed base image
 #   --sync-omarchy DIR Push DIR's test/acceptance into the guest before running
@@ -36,6 +38,7 @@ MEMORY=8192
 INSTALL_TIMEOUT=2400
 BOOT_TIMEOUT=600
 ENCRYPT=false
+OEM=false
 REUSE_BASE=false
 INSTALL_ONLY=false
 KEEP_RUNNING=false
@@ -50,6 +53,7 @@ GUEST_HOSTNAME="omarchy-test"
 while (($#)); do
   case "$1" in
     --encrypt) ENCRYPT=true ;;
+    --oem) OEM=true ;;
     --reuse-base) REUSE_BASE=true ;;
     --install-only) INSTALL_ONLY=true ;;
     --keep-running) KEEP_RUNNING=true ;;
@@ -86,6 +90,7 @@ OVMF_VARS_TEMPLATE="/usr/share/edk2/x64/OVMF_VARS.4m.fd"
 
 BASE_NAME="$(basename "$ISO" .iso)"
 $ENCRYPT && BASE_NAME+="-encrypted"
+$OEM && BASE_NAME+="-oem"
 BASE_DIR="$REPO_DIR/test-runs/$BASE_NAME"
 RUN_DIR="$BASE_DIR/runs/$(date +%Y%m%d-%H%M%S)"
 BASE_DISK="$BASE_DIR/base.qcow2"
@@ -580,59 +585,111 @@ drive_configurator() {
   capture_console "success-installer-01-keyboard-layout"
   press ret # English (US) is preselected
 
+  wait_for_screen "install disk" 120
+  capture_console "success-installer-02-install-disk"
+  press ret # the single virtio disk
+
+  wait_for_screen "installation mode" 60
+  capture_console "success-installer-03-install-mode"
+  if $OEM; then
+    press down # "OEM install" sits below "Full disk install" on a blank disk
+  fi
+  press ret
+
+  wait_for_screen "recovery possible" 60
+  capture_console "success-installer-04-disk-warning-encrypted"
+  if ! $ENCRYPT; then
+    press ctrl-c # toggles the confirm to the unencrypted flow
+    wait_for_screen "without encryption" 30
+    capture_console "success-installer-05-disk-warning-unencrypted"
+  fi
+  press ret
+
+  if $OEM; then
+    # OEM installs skip the user step entirely; the install starts right away.
+    sleep 2
+    capture_console "success-installer-13-install-started"
+    return 0
+  fi
+
   wait_for_screen "Username" 120
   type_text "$GUEST_USER"
-  capture_console "success-installer-02-username"
+  capture_console "success-installer-06-username"
   press ret
 
   wait_for_screen "Password" 60
   type_text "$GUEST_PASSWORD"
-  capture_console "success-installer-03-password"
+  capture_console "success-installer-07-password"
   press ret
 
   wait_for_screen "Must match" 60
   type_text "$GUEST_PASSWORD"
-  capture_console "success-installer-04-password-confirmation"
+  capture_console "success-installer-08-password-confirmation"
   press ret
 
   wait_for_screen "Full name" 60
   type_text "Omarchy Test"
-  capture_console "success-installer-05-full-name"
+  capture_console "success-installer-09-full-name"
   press ret
 
   wait_for_screen "Email address" 60
   type_text "test@omarchy.org"
-  capture_console "success-installer-06-email"
+  capture_console "success-installer-10-email"
   press ret
 
   wait_for_screen "Hostname" 60
   type_text "$GUEST_HOSTNAME"
-  capture_console "success-installer-07-hostname"
+  capture_console "success-installer-11-hostname"
   press ret
 
   wait_for_screen "Timezone" 180 # tzupdate geo-guess can take a moment
-  capture_console "success-installer-08-timezone"
+  capture_console "success-installer-12-timezone"
   press ret
 
   wait_for_screen "look right" 60
-  capture_console "success-installer-09-review"
-  press ret
-
-  wait_for_screen "install disk" 60
-  capture_console "success-installer-10-install-disk"
-  press ret # the single virtio disk
-
-  wait_for_screen "recovery possible" 60
-  capture_console "success-installer-11-disk-warning-encrypted"
-  if ! $ENCRYPT; then
-    press ctrl-c # toggles the confirm to the unencrypted flow
-    wait_for_screen "without encryption" 30
-    capture_console "success-installer-12-disk-warning-unencrypted"
-  fi
+  capture_console "success-installer-13-review"
   press ret
 
   sleep 2
-  capture_console "success-installer-13-install-started"
+  capture_console "success-installer-14-install-started"
+}
+
+# The OEM first boot runs the user form on tty1 (omarchy-oem-setup) before
+# SDDM. Encrypted OEM installs auto-unlock from the staged keyfile, so there
+# is no LUKS prompt to answer here either way.
+drive_oem_setup() {
+  log "Driving the OEM first-boot setup"
+
+  wait_for_screen "Username" 600
+  capture_console "success-oem-01-username"
+  type_text "$GUEST_USER"
+  press ret
+
+  wait_for_screen "Password" 60
+  type_text "$GUEST_PASSWORD"
+  capture_console "success-oem-02-password"
+  press ret
+
+  wait_for_screen "Must match" 60
+  type_text "$GUEST_PASSWORD"
+  press ret
+
+  wait_for_screen "Full name" 60
+  type_text "Omarchy Test"
+  press ret
+
+  wait_for_screen "Email address" 60
+  type_text "test@omarchy.org"
+  capture_console "success-oem-03-email"
+  press ret
+
+  wait_for_screen "look right" 60
+  capture_console "success-oem-04-review"
+  press ret
+
+  # Finalization (offline Node unpack, LUKS re-key on encrypted installs)
+  # runs before SDDM appears.
+  capture_console "success-oem-05-finalizing"
 }
 
 wait_for_install() {
@@ -835,7 +892,9 @@ install_phase() {
   drive_configurator
   wait_for_install
 
-  if $ENCRYPT; then
+  if $OEM; then
+    drive_oem_setup
+  elif $ENCRYPT; then
     unlock_luks
   fi
   bootstrap_ssh

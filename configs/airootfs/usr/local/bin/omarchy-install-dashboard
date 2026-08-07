@@ -321,11 +321,13 @@ install_progress() {
     "Installing Arch + Omarchy")  lo=65  hi=700  tau=150 pkg_signal=1 ;;
     "Configuring hibernation")    lo=700 hi=720  tau=10  ;;
     "Configuring system")         lo=720 hi=850  tau=120 ;;
-    "Finalizing Limine boot")     lo=850 hi=950  tau=90  ;;
+    "Staging OEM state")          lo=850 hi=855  tau=5   ;;
+    "Finalizing Limine boot")     lo=855 hi=950  tau=90  ;;
     "Finalizing user")            lo=950 hi=978  tau=30  ;;
     "Configuring login")          lo=978 hi=988  tau=5   ;;
     "Configuring DNS resolver")   lo=988 hi=994  tau=5   ;;
-    "Validating boot setup")      lo=994 hi=1000 tau=5   ;;
+    "Validating boot setup")      lo=994 hi=998  tau=5   ;;
+    "Creating factory snapshot")  lo=998 hi=1000 tau=5   ;;
     *)
       # Unknown names used to inherit a 1->99 sweep. Derive an even band from
       # the published index instead; with no index, a bounded slice, so a
