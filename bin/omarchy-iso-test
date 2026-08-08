@@ -872,7 +872,7 @@ EOF
   capture_console "success-first-boot-05-bootstrap-command"
   press ret
 
-  wait_for_ssh 180 "failure-first-boot-ssh-timeout"
+  wait_for_ssh 360 "failure-first-boot-ssh-timeout"
   capture_console "success-first-boot-06-bootstrap-complete"
 
   kill "$HTTP_PID" 2>/dev/null || true

@@ -908,7 +908,13 @@ select_installation() {
       full_disk_only=false
     fi
 
-    install_mode_form
+    # With no free-space option to offer, a full-disk install is the only
+    # mode, so skip the picker and go straight to the overwrite confirm.
+    if $full_disk_only; then
+      install_mode="Full disk install"
+    else
+      install_mode_form
+    fi
 
     case "$install_mode" in
       "Full disk install")
@@ -916,6 +922,9 @@ select_installation() {
           install_target="full_disk"
           return 0
         fi
+        # When the picker was skipped, declining the overwrite means the user
+        # wants a different disk.
+        $full_disk_only && disk_form
         ;;
       "Free space install"*)
         if run_partition_decide; then
