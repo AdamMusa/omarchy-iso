@@ -164,8 +164,7 @@ confirm_prepare_for_another_owner() {
   clear_logo
   echo
   say "This prepares the machine for another owner."
-  say --foreground 8 "The system installs now, but they pick their keyboard and create"
-  say --foreground 8 "their user on the machine's first boot."
+  say --foreground 8 "The system installs now, but setup is delayed until first boot."
   echo
   gum confirm --affirmative "Yes, prepare for another owner" --negative "No, keep setting up" \
     "Prepare this machine for another owner?"
