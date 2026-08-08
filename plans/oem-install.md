@@ -102,12 +102,12 @@ user's password.
 ## Runtime-side changes (omarchy repo)
 
 - `omarchy-oem-setup` + `omarchy-oem-setup.service` (the OOBE above).
-- `omarchy-reset-computer` (below).
+- `omarchy-system-factory-reset` (below).
 - Relax `omarchy-setup-system`: when the install user doesn't exist yet, the
   three `usermod -aG` scripts append to `/var/lib/omarchy/oem/groups` instead
   of failing the getent check.
 
-## Reset: `omarchy-reset-computer`
+## Reset: `omarchy-system-factory-reset`
 
 Behind a very explicit confirmation (typed, not y/n):
 
@@ -154,7 +154,7 @@ on it existing. So:
 - VM: OEM install (encrypted + unencrypted) → reboot → OOBE → session; verify
   LUKS passphrase is the user's, throwaway key gone, groups applied,
   `omarchy-finalize-user` state marker present.
-- VM: normal install → use system → `omarchy-reset-computer` → OOBE as new
+- VM: normal install → use system → `omarchy-system-factory-reset` → OOBE as new
   user; verify no trace of prior user (home, NM connections, tailscale,
   machine-id, host keys, snapper snapshots).
 - Autoinstall: cidata drive with `oem` marker and no credentials → unattended

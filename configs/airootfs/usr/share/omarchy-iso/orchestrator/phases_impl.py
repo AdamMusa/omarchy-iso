@@ -1150,7 +1150,7 @@ def run_system_finalizer(ctx: InstallContext) -> None:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # stage_oem_state: produce the on-disk "OEM state" the runtime's first-boot
-# setup (omarchy-oem-setup) and factory reset (omarchy-reset-computer) consume.
+# setup (omarchy-oem-setup) and factory reset (omarchy-system-factory-reset) consume.
 #
 # Every install stashes the bundled Node tarball in /var/lib/omarchy/oem/
 # so a later factory reset can finalize the new owner's user offline. OEM-mode
@@ -1784,7 +1784,7 @@ def _validate_pre_mounted_filesystems(ctx: InstallContext) -> None:
 # create_factory_snapshot: read-only snapshot of @ kept at the btrfs top level
 # as @factory — outside snapper's .snapshots, so cleanup timers and the Limine
 # snapshot menu never touch it. Zero bytes at creation; grows only with drift.
-# Taken at the end of every install, it is what makes omarchy-reset-computer a
+# Taken at the end of every install, it is what makes omarchy-system-factory-reset a
 # true factory reset.
 # ─────────────────────────────────────────────────────────────────────────────
 
