@@ -606,19 +606,16 @@ audio-panel|meta_l-ctrl-a|omarchy-keyboard-panel|omarchy.audio'
 drive_configurator() {
   log "Driving the installer wizard"
 
-  wait_for_screen "keyboard layout" 300
-  capture_console "success-installer-01-keyboard-layout"
-  press ret # English (US) is preselected
-
-  wait_for_screen "install disk" 120
-  capture_console "success-installer-02-install-disk"
+  # Disk first (the keyboard step moved after mode selection, and OEM skips it).
+  wait_for_screen "install disk" 300
+  capture_console "success-installer-01-install-disk"
   press ret # the single virtio disk
 
   # A blank disk shows the mode picker only when the bundled runtime supports
   # OEM mode; otherwise the wizard goes straight to the overwrite confirm.
   wait_for_screen "installation mode\|recovery possible" 60
   if ocr_screen | grep -qi "installation mode"; then
-    capture_console "success-installer-03-install-mode"
+    capture_console "success-installer-02-install-mode"
     if $OEM; then
       press down # "OEM install" sits below "Full disk install" on a blank disk
     fi
@@ -630,20 +627,24 @@ drive_configurator() {
   fi
 
   wait_for_screen "recovery possible" 60
-  capture_console "success-installer-04-disk-warning-encrypted"
+  capture_console "success-installer-03-disk-warning-encrypted"
   if ! $ENCRYPT; then
     press ctrl-c # toggles the confirm to the unencrypted flow
     wait_for_screen "without encryption" 30
-    capture_console "success-installer-05-disk-warning-unencrypted"
+    capture_console "success-installer-04-disk-warning-unencrypted"
   fi
   press ret
 
   if $OEM; then
-    # OEM installs skip the user step entirely; the install starts right away.
+    # OEM installs skip the keyboard and user steps; the install starts now.
     sleep 2
     capture_console "success-installer-13-install-started"
     return 0
   fi
+
+  wait_for_screen "keyboard layout" 60
+  capture_console "success-installer-05-keyboard-layout"
+  press ret # English (US) is preselected
 
   wait_for_screen "Username" 120
   type_text "$GUEST_USER"
@@ -693,14 +694,19 @@ drive_configurator() {
 drive_oem_setup() {
   log "Driving the OEM first-boot setup"
 
-  wait_for_screen "Username" 600
-  capture_console "success-oem-01-username"
+  # OEM defers the keyboard step to first boot; it comes before the user form.
+  wait_for_screen "keyboard layout" 600
+  capture_console "success-oem-01-keyboard-layout"
+  press ret # English (US) preselected
+
+  wait_for_screen "Username" 120
+  capture_console "success-oem-02-username"
   type_text "$GUEST_USER"
   press ret
 
   wait_for_screen "Password" 60
   type_text "$GUEST_PASSWORD"
-  capture_console "success-oem-02-password"
+  capture_console "success-oem-03-password"
   press ret
 
   wait_for_screen "Conf *irm" 60
@@ -713,16 +719,16 @@ drive_oem_setup() {
 
   wait_for_screen "Email address" 60
   type_text "test@omarchy.org"
-  capture_console "success-oem-03-email"
+  capture_console "success-oem-04-email"
   press ret
 
   wait_for_screen "look right" 60
-  capture_console "success-oem-04-review"
+  capture_console "success-oem-05-review"
   press ret
 
   # Finalization (offline Node unpack, LUKS re-key on encrypted installs)
   # runs before SDDM appears.
-  capture_console "success-oem-05-finalizing"
+  capture_console "success-oem-06-finalizing"
 }
 
 wait_for_install() {

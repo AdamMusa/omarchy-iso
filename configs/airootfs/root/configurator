@@ -134,9 +134,9 @@ Ukrainian|ua'
   fi
 }
 
-keyboard_form
-
-# STEP 2: USER (run after the install mode is chosen — OEM installs skip it)
+# Keyboard and user run after the install mode is chosen. OEM installs skip
+# both — the machine's first owner picks their keyboard and creates their user
+# in the first-boot setup, so the OEM operator sets nothing user-specific.
 
 user_form() {
   step "Let's setup your user account..."
@@ -944,9 +944,13 @@ install_target="full_disk"
 disk_form
 select_installation
 
-# STEP 4: USER (OEM installs defer this to the machine's first boot)
+# STEP 3: KEYBOARD + USER (OEM defers both to the machine's first boot)
 
 if $oem_install; then
+  # A defined default keymap so the system boots before first-boot setup; the
+  # owner picks their real layout in the OOBE, which re-keys the console and,
+  # on encrypted installs, rebuilds the initramfs so the LUKS prompt matches.
+  keyboard="us"
   username=""
   password=""
   password_hash=""
@@ -955,6 +959,9 @@ if $oem_install; then
   hostname="omarchy"
   timezone="UTC"
 else
+  # Keyboard before the user step so the LUKS passphrase is typed under the
+  # chosen layout (typing it under the wrong one locks the user out at boot).
+  keyboard_form
   user_step
 fi
 
