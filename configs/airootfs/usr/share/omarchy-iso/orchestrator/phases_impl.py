@@ -1208,13 +1208,13 @@ def stage_oem_state(ctx: InstallContext) -> None:
 def _stage_node_tarball(ctx: InstallContext, oem_dir) -> None:
     tarballs = sorted(NODE_PACKAGES_DIR.glob("node-v*-linux-x64.tar.gz"))
     if not tarballs:
-        if ctx.oem:
-            raise RuntimeError(
-                "no bundled Node tarball in /opt/packages — OEM first-boot setup "
-                "could not finalize the user offline"
-            )
-        info("› no bundled Node tarball to stash for factory reset; skipping")
-        return
+        # Hard error on every install, not just OEM: the stash is what lets a
+        # later factory reset finalize the next owner offline, and an ISO
+        # build always bundles the tarball — its absence means a broken build.
+        raise RuntimeError(
+            f"no bundled Node tarball in {NODE_PACKAGES_DIR} — first-boot setup "
+            "and factory reset could not finalize a user offline"
+        )
 
     packages_dir = oem_dir / "packages"
     packages_dir.mkdir(parents=True, exist_ok=True)
@@ -1820,11 +1820,39 @@ def create_factory_snapshot(ctx: InstallContext) -> None:
 
         info("› snapshotting @ as @factory (read-only)")
         subprocess.run(
-            ["btrfs", "subvolume", "snapshot", "-r", str(root_subvol), str(factory)],
+            ["btrfs", "subvolume", "snapshot", str(root_subvol), str(factory)],
+            check=True,
+        )
+        _scrub_factory_snapshot(factory)
+        subprocess.run(
+            ["btrfs", "property", "set", "-ts", str(factory), "ro", "true"],
             check=True,
         )
     finally:
         subprocess.run(["umount", str(top)], check=False, capture_output=True)
+
+
+# Provisioning credentials staged for THIS deployment's first boot must not
+# survive into the factory image: a reset years later would otherwise hand the
+# next owner the original deployment's SSH keys or rejoin its tailnet, and a
+# stale OEM LUKS key (dead after the first re-key) has no business lingering.
+# The mkinitcpio/cmdline drop-ins go with the keyfile — a reset rebuild would
+# otherwise fail on FILES pointing at a scrubbed path.
+FACTORY_SCRUB_PATHS = (
+    "var/lib/omarchy/oem/authorized_keys",
+    "var/lib/omarchy/oem/luks-key",
+    "etc/omarchy/oem.key",
+    "etc/limine-entry-tool.d/99-omarchy-oem-unlock.conf",
+    "etc/mkinitcpio.conf.d/99-omarchy-oem-key.conf",
+    "etc/tailscale/authkey",
+    "etc/systemd/system/omarchy-tailscale-join.service",
+    "etc/systemd/system/multi-user.target.wants/omarchy-tailscale-join.service",
+)
+
+
+def _scrub_factory_snapshot(factory: Path) -> None:
+    for rel in FACTORY_SCRUB_PATHS:
+        (factory / rel).unlink(missing_ok=True)
 
 
 def _findmnt_value(path: Path, column: str) -> str | None:

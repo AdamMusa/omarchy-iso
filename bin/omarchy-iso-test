@@ -614,12 +614,20 @@ drive_configurator() {
   capture_console "success-installer-02-install-disk"
   press ret # the single virtio disk
 
-  wait_for_screen "installation mode" 60
-  capture_console "success-installer-03-install-mode"
-  if $OEM; then
-    press down # "OEM install" sits below "Full disk install" on a blank disk
+  # A blank disk shows the mode picker only when the bundled runtime supports
+  # OEM mode; otherwise the wizard goes straight to the overwrite confirm.
+  wait_for_screen "installation mode\|recovery possible" 60
+  if ocr_screen | grep -qi "installation mode"; then
+    capture_console "success-installer-03-install-mode"
+    if $OEM; then
+      press down # "OEM install" sits below "Full disk install" on a blank disk
+    fi
+    press ret
+  elif $OEM; then
+    capture_console "failure-installer-no-oem-choice"
+    echo "OEM flow requested but this ISO does not offer OEM mode" >&2
+    return 1
   fi
-  press ret
 
   wait_for_screen "recovery possible" 60
   capture_console "success-installer-04-disk-warning-encrypted"

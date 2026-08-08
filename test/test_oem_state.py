@@ -121,6 +121,22 @@ class ContextOemTest(unittest.TestCase):
             "rig-secret",
         )
 
+    def test_oem_discards_account_material_from_supplied_credentials(self):
+        # A rig credentials file must not smuggle in users or a root password.
+        self.write_config(self.base_config(oem=True))
+        self.write_creds({
+            "users": [{"username": "backdoor", "enc_password": "x", "sudo": True}],
+            "root_enc_password": "x",
+            "encryption_password": "rig-secret",
+        })
+        ctx = self.from_env()
+        self.assertEqual(ctx.user_credentials["users"], [])
+        self.assertNotIn("root_enc_password", ctx.user_credentials)
+        self.assertEqual(ctx.user_credentials["encryption_password"], "rig-secret")
+        synthesized = json.loads(ctx.creds_path.read_text())
+        self.assertEqual(synthesized["users"], [])
+        self.assertNotIn("root_enc_password", synthesized)
+
     def test_oem_unencrypted_touches_nothing(self):
         self.write_config(self.base_config(oem=True))
         ctx = self.from_env()
@@ -191,6 +207,14 @@ class StageOemStateTest(unittest.TestCase):
             tarball.unlink()
         self.install_runtime_oem_support()
         ctx = make_ctx(self.target)
+        with self.assertRaisesRegex(RuntimeError, "Node tarball"):
+            phases_impl.stage_oem_state(ctx)
+
+    def test_missing_node_tarball_fails_normal_installs_too(self):
+        # The stash is what makes a later factory reset work offline.
+        for tarball in self.packages.glob("*.tar.gz"):
+            tarball.unlink()
+        ctx = make_ctx(self.target, oem=False)
         with self.assertRaisesRegex(RuntimeError, "Node tarball"):
             phases_impl.stage_oem_state(ctx)
 
@@ -357,10 +381,35 @@ class CreateFactorySnapshotTest(unittest.TestCase):
         top = str(self.state_dir / "factory-top")
         self.assertIn(["mount", "-o", "subvolid=5", "/dev/mapper/omarchy_root", top], self.calls)
         self.assertIn(
-            ["btrfs", "subvolume", "snapshot", "-r", f"{top}/@", f"{top}/@factory"],
+            ["btrfs", "subvolume", "snapshot", f"{top}/@", f"{top}/@factory"],
+            self.calls,
+        )
+        self.assertIn(
+            ["btrfs", "property", "set", "-ts", f"{top}/@factory", "ro", "true"],
             self.calls,
         )
         self.assertIn(["umount", top], self.calls)
+
+    def test_factory_snapshot_scrubs_provisioning_credentials(self):
+        # Simulate the snapshot carrying deployment credentials; the scrub
+        # must drop them before the snapshot goes read-only.
+        top = self.state_dir / "factory-top"
+        factory = top / "@factory"
+        secrets = [
+            factory / "var/lib/omarchy/oem/authorized_keys",
+            factory / "etc/tailscale/authkey",
+            factory / "etc/omarchy/oem.key",
+        ]
+        keep = factory / "var/lib/omarchy/oem/groups"
+        for path in [*secrets, keep]:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("secret")
+
+        phases_impl.create_factory_snapshot(self.ctx())
+
+        for path in secrets:
+            self.assertFalse(path.exists(), path)
+        self.assertTrue(keep.exists())
 
     def test_non_btrfs_target_skips(self):
         self.findmnt["FSTYPE"] = "ext4"

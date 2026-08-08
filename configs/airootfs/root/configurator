@@ -791,7 +791,8 @@ oem_supported() {
     OEM_SUPPORTED=true
     if [[ -d $mirror ]]; then
       pkg=$(ls "$mirror/$OMARCHY_RUNTIME_PACKAGE"-[0-9]*.pkg.tar.zst 2>/dev/null | head -1)
-      if [[ -z $pkg ]] || ! tar -tf "$pkg" usr/bin/omarchy-oem-setup &>/dev/null; then
+      if [[ -z $pkg ]] || ! tar -tf "$pkg" usr/bin/omarchy-oem-setup \
+        usr/share/omarchy/install/oem/omarchy-oem-setup.service &>/dev/null; then
         OEM_SUPPORTED=false
       fi
     fi

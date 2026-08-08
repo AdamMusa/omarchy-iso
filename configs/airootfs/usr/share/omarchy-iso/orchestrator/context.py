@@ -65,6 +65,15 @@ class InstallContext:
         else:
             raise RuntimeError(f"credentials file missing: {creds_path}")
 
+        if oem:
+            # OEM promises no account exists until first boot. A supplied
+            # credentials file (a rig handing over its LUKS passphrase) must
+            # not smuggle in users or a root password.
+            encryption_password = user_credentials.get("encryption_password")
+            user_credentials = {"users": []}
+            if encryption_password:
+                user_credentials["encryption_password"] = encryption_password
+
         arch_configuration = dict(user_configuration)
         arch_configuration.pop("omarchy_install", None)
         state_dir = Path(os.environ.get("OMARCHY_INSTALL_STATE_DIR", "/run/omarchy-install"))
