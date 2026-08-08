@@ -1136,8 +1136,8 @@ def _run_target_setup_command(ctx: InstallContext, cmd: list[str], *, user: str 
 
 
 def run_system_finalizer(ctx: InstallContext) -> None:
-    if ctx.oem:
-        cmd = ["/usr/bin/omarchy-setup-system", "--oem", "--first-install"]
+    if ctx.defer_provisioning:
+        cmd = ["/usr/bin/omarchy-setup-system", "--defer-provisioning", "--first-install"]
     else:
         cmd = ["/usr/bin/omarchy-setup-system", "--install-user", ctx.username, "--first-install"]
 
@@ -1149,66 +1149,66 @@ def run_system_finalizer(ctx: InstallContext) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# stage_oem_state: produce the on-disk "OEM state" the runtime's first-boot
-# setup (omarchy-oem-setup) and factory reset (omarchy-system-factory-reset) consume.
+# stage_provisioning_state: produce the on-disk "provisioning state" the runtime's first-boot
+# setup (omarchy-provision-owner) and factory reset (omarchy-system-factory-reset) consume.
 #
-# Every install stashes the bundled Node tarball in /var/lib/omarchy/oem/
-# so a later factory reset can finalize the new owner's user offline. OEM-mode
+# Every install stashes the bundled Node tarball in /var/lib/omarchy/provisioning/
+# so a later factory reset can finalize the new owner's user offline. deferred-provisioning
 # installs additionally arm the first-boot setup service and, on encrypted
 # targets, stage the throwaway LUKS passphrase: the keyfile embedded in the
-# initramfs auto-unlocks boot during the OEM window, and first-boot setup
+# initramfs auto-unlocks boot during the provisioning window, and first-boot setup
 # re-keys the volume to the owner's password and removes it.
 #
 # Runs before finalize_limine_boot so the cryptkey cmdline drop-in and the
 # keyfile land in the final UKI build.
 # ─────────────────────────────────────────────────────────────────────────────
 
-OEM_STATE_DIR = "var/lib/omarchy/oem"
-OEM_KEYFILE = "etc/omarchy/oem.key"
+PROVISION_STATE_DIR = "var/lib/omarchy/provisioning"
+PROVISION_KEYFILE = "etc/omarchy/provisioning.key"
 NODE_PACKAGES_DIR = Path("/opt/packages")
 
 
-def stage_oem_state(ctx: InstallContext) -> None:
+def stage_provisioning_state(ctx: InstallContext) -> None:
     # World-readable: first-boot finalization reads the Node tarball as the
     # new user. The only secret inside (luks-key) is itself 0600 root.
-    oem_dir = ctx.target / OEM_STATE_DIR
-    oem_dir.mkdir(parents=True, exist_ok=True)
-    oem_dir.chmod(0o755)
+    provisioning_dir = ctx.target / PROVISION_STATE_DIR
+    provisioning_dir.mkdir(parents=True, exist_ok=True)
+    provisioning_dir.chmod(0o755)
 
-    _stage_node_tarball(ctx, oem_dir)
+    _stage_node_tarball(ctx, provisioning_dir)
 
-    if not ctx.oem:
+    if not ctx.defer_provisioning:
         return
 
-    service_src = ctx.target / "usr/share/omarchy/install/oem/omarchy-oem-setup.service"
-    setup_bin = ctx.target / "usr/bin/omarchy-oem-setup"
+    service_src = ctx.target / "usr/share/omarchy/install/provisioning/omarchy-provision-owner.service"
+    setup_bin = ctx.target / "usr/bin/omarchy-provision-owner"
     if not service_src.exists() or not setup_bin.exists():
         raise RuntimeError(
-            "OEM install requested, but the installed Omarchy runtime does not ship "
-            "first-boot setup (omarchy-oem-setup + install/oem/omarchy-oem-setup.service). "
-            "Update the runtime package this ISO bundles before installing in OEM mode."
+            "deferred-provisioning install requested, but the installed Omarchy runtime does not ship "
+            "first-boot setup (omarchy-provision-owner + install/provisioning/omarchy-provision-owner.service). "
+            "Update the runtime package this ISO bundles before installing in deferred provisioning."
         )
 
-    info("› arming first-boot OEM setup")
-    (oem_dir / "pending").touch()
+    info("› arming first-boot setup")
+    (provisioning_dir / "pending").touch()
 
-    unit_dst = ctx.target / "etc/systemd/system/omarchy-oem-setup.service"
+    unit_dst = ctx.target / "etc/systemd/system/omarchy-provision-owner.service"
     unit_dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(service_src, unit_dst)
     wants_dir = ctx.target / "etc/systemd/system/multi-user.target.wants"
     wants_dir.mkdir(parents=True, exist_ok=True)
-    link = wants_dir / "omarchy-oem-setup.service"
+    link = wants_dir / "omarchy-provision-owner.service"
     link.unlink(missing_ok=True)
-    link.symlink_to("/etc/systemd/system/omarchy-oem-setup.service")
+    link.symlink_to("/etc/systemd/system/omarchy-provision-owner.service")
 
-    if _oem_install_encrypted(ctx):
-        _stage_oem_luks_unlock(ctx, oem_dir)
+    if _provision_install_encrypted(ctx):
+        _stage_provisioning_luks_unlock(ctx, provisioning_dir)
 
 
-def _stage_node_tarball(ctx: InstallContext, oem_dir) -> None:
+def _stage_node_tarball(ctx: InstallContext, provisioning_dir) -> None:
     tarballs = sorted(NODE_PACKAGES_DIR.glob("node-v*-linux-x64.tar.gz"))
     if not tarballs:
-        # Hard error on every install, not just OEM: the stash is what lets a
+        # Hard error on every install, not just deferred-provisioning installs: the stash is what lets a
         # later factory reset finalize the next owner offline, and an ISO
         # build always bundles the tarball — its absence means a broken build.
         raise RuntimeError(
@@ -1216,7 +1216,7 @@ def _stage_node_tarball(ctx: InstallContext, oem_dir) -> None:
             "and factory reset could not finalize a user offline"
         )
 
-    packages_dir = oem_dir / "packages"
+    packages_dir = provisioning_dir / "packages"
     packages_dir.mkdir(parents=True, exist_ok=True)
     target_tarball = packages_dir / tarballs[0].name
     if not target_tarball.exists():
@@ -1224,7 +1224,7 @@ def _stage_node_tarball(ctx: InstallContext, oem_dir) -> None:
         shutil.copy2(tarballs[0], target_tarball)
 
 
-def _oem_install_encrypted(ctx: InstallContext) -> bool:
+def _provision_install_encrypted(ctx: InstallContext) -> bool:
     if _storage_intent(ctx).get("luks_uuid"):
         return True
     disk_encryption = (ctx.user_configuration.get("disk_config") or {}).get("disk_encryption")
@@ -1233,43 +1233,43 @@ def _oem_install_encrypted(ctx: InstallContext) -> bool:
     return ctx.encrypt
 
 
-def _oem_encryption_password(ctx: InstallContext) -> str | None:
+def _provision_encryption_password(ctx: InstallContext) -> str | None:
     disk_encryption = (ctx.user_configuration.get("disk_config") or {}).get("disk_encryption") or {}
     return disk_encryption.get("encryption_password") or ctx.user_credentials.get("encryption_password")
 
 
-def _stage_oem_luks_unlock(ctx: InstallContext, oem_dir) -> None:
-    password = _oem_encryption_password(ctx)
+def _stage_provisioning_luks_unlock(ctx: InstallContext, provisioning_dir) -> None:
+    password = _provision_encryption_password(ctx)
     if not password:
-        # Full-disk OEM installs get a generated passphrase injected by
+        # Full-disk deferred-provisioning installs get a generated passphrase injected by
         # InstallContext; only a pre-mounted (rig-partitioned) LUKS target can
         # land here, and it must hand over the passphrase it formatted with.
         raise RuntimeError(
-            "OEM install on a pre-encrypted target requires the LUKS passphrase "
+            "deferred-provisioning install on a pre-encrypted target requires the LUKS passphrase "
             "in user_credentials.json (encryption_password) so first boot can re-key"
         )
 
-    info("› staging LUKS auto-unlock for the OEM window")
+    info("› staging LUKS auto-unlock for the provisioning window")
 
     # Byte-for-byte the slot passphrase: no trailing newline anywhere.
-    luks_key = oem_dir / "luks-key"
+    luks_key = provisioning_dir / "luks-key"
     luks_key.write_text(password)
     luks_key.chmod(0o600)
 
-    keyfile = ctx.target / OEM_KEYFILE
+    keyfile = ctx.target / PROVISION_KEYFILE
     keyfile.parent.mkdir(parents=True, exist_ok=True)
     keyfile.write_text(password)
     keyfile.chmod(0o600)
 
-    cmdline_dropin = ctx.target / "etc/limine-entry-tool.d/99-omarchy-oem-unlock.conf"
+    cmdline_dropin = ctx.target / "etc/limine-entry-tool.d/99-omarchy-provisioning-unlock.conf"
     cmdline_dropin.parent.mkdir(parents=True, exist_ok=True)
     cmdline_dropin.write_text(
-        'KERNEL_CMDLINE[default]+=" cryptkey=rootfs:/etc/omarchy/oem.key"\n'
+        'KERNEL_CMDLINE[default]+=" cryptkey=rootfs:/etc/omarchy/provisioning.key"\n'
     )
 
-    files_dropin = ctx.target / "etc/mkinitcpio.conf.d/99-omarchy-oem-key.conf"
+    files_dropin = ctx.target / "etc/mkinitcpio.conf.d/99-omarchy-provisioning-key.conf"
     files_dropin.parent.mkdir(parents=True, exist_ok=True)
-    files_dropin.write_text("FILES+=(/etc/omarchy/oem.key)\n")
+    files_dropin.write_text("FILES+=(/etc/omarchy/provisioning.key)\n")
 
 
 def finalize_limine_boot(ctx: InstallContext) -> None:
@@ -1365,8 +1365,8 @@ def _limine_kernel_cmdline(config_text: str) -> str:
 
 
 def run_chroot_finalizer(ctx: InstallContext) -> None:
-    if ctx.oem:
-        info("› OEM install: user finalization deferred to first boot")
+    if ctx.defer_provisioning:
+        info("› deferred-provisioning install: user finalization deferred to first boot")
         return
 
     _run_target_setup_command(
@@ -1415,18 +1415,18 @@ def configure_login(ctx: InstallContext) -> None:
     )
 
     autologin_conf = sddm_dir / "autologin.conf"
-    if ctx.encrypt and not ctx.oem:
+    if ctx.encrypt and not ctx.defer_provisioning:
         autologin_conf.write_text(
             "[Autologin]\n"
             f"User={ctx.username}\n"
             "Session=omarchy.desktop\n"
         )
     else:
-        # OEM installs have no user yet; omarchy-oem-setup writes autologin
+        # deferred-provisioning installs have no user yet; omarchy-provision-owner writes autologin
         # and SDDM state at first boot once the owner exists.
         autologin_conf.unlink(missing_ok=True)
 
-    if not ctx.oem:
+    if not ctx.defer_provisioning:
         state_dir = ctx.target / "var" / "lib" / "sddm"
         state_dir.mkdir(parents=True, exist_ok=True)
         (state_dir / "state.conf").write_text(
@@ -1460,14 +1460,14 @@ def configure_ssh_access(ctx: InstallContext) -> None:
 
     keys = _authorized_keys(ctx.authorized_keys_path)
 
-    if ctx.oem:
-        # No user to authorize yet. Stage the keys in OEM state for
-        # omarchy-oem-setup to install once first boot creates the owner, and
+    if ctx.defer_provisioning:
+        # No user to authorize yet. Stage the keys in provisioning state for
+        # omarchy-provision-owner to install once first boot creates the owner, and
         # still open the door (sshd + ufw) below.
         info(f"› staging {len(keys)} SSH key(s) for the first-boot user")
-        oem_dir = ctx.target / OEM_STATE_DIR
-        oem_dir.mkdir(parents=True, exist_ok=True)
-        staged = oem_dir / "authorized_keys"
+        provisioning_dir = ctx.target / PROVISION_STATE_DIR
+        provisioning_dir.mkdir(parents=True, exist_ok=True)
+        staged = provisioning_dir / "authorized_keys"
         staged.write_text("".join(f"{key}\n" for key in keys))
         staged.chmod(0o600)
     else:
@@ -1695,33 +1695,33 @@ def validate_boot(ctx: InstallContext) -> None:
     if ctx.is_protected:
         _validate_pre_mounted_filesystems(ctx)
 
-    if ctx.oem:
-        _validate_oem_state(ctx)
+    if ctx.defer_provisioning:
+        _validate_provisioning_state(ctx)
 
 
-def _validate_oem_state(ctx: InstallContext) -> None:
-    """An OEM install that boots without a working first-boot setup is a
+def _validate_provisioning_state(ctx: InstallContext) -> None:
+    """An deferred-provisioning install that boots without a working first-boot setup is a
     user-less brick; insist the armed state is complete before reboot."""
-    oem_dir = ctx.target / OEM_STATE_DIR
-    if not (oem_dir / "pending").exists():
-        raise RuntimeError(f"OEM install but {oem_dir / 'pending'} is missing")
+    provisioning_dir = ctx.target / PROVISION_STATE_DIR
+    if not (provisioning_dir / "pending").exists():
+        raise RuntimeError(f"deferred-provisioning install but {provisioning_dir / 'pending'} is missing")
 
-    link = ctx.target / "etc/systemd/system/multi-user.target.wants/omarchy-oem-setup.service"
+    link = ctx.target / "etc/systemd/system/multi-user.target.wants/omarchy-provision-owner.service"
     if not link.is_symlink():
-        raise RuntimeError("OEM install but omarchy-oem-setup.service is not enabled")
+        raise RuntimeError("deferred-provisioning install but omarchy-provision-owner.service is not enabled")
 
-    if not list((oem_dir / "packages").glob("node-v*.tar.gz")):
-        raise RuntimeError(f"OEM install but no Node tarball staged in {oem_dir / 'packages'}")
+    if not list((provisioning_dir / "packages").glob("node-v*.tar.gz")):
+        raise RuntimeError(f"deferred-provisioning install but no Node tarball staged in {provisioning_dir / 'packages'}")
 
-    if _oem_install_encrypted(ctx):
-        for required in (oem_dir / "luks-key", ctx.target / OEM_KEYFILE):
+    if _provision_install_encrypted(ctx):
+        for required in (provisioning_dir / "luks-key", ctx.target / PROVISION_KEYFILE):
             if not required.exists():
-                raise RuntimeError(f"encrypted OEM install but {required} is missing")
+                raise RuntimeError(f"encrypted deferred-provisioning install but {required} is missing")
         limine_conf_text = (
             ctx.target / _boot_intent(ctx)["esp_mount"].lstrip("/") / "limine.conf"
         ).read_text()
         if "cryptkey=rootfs:" not in limine_conf_text:
-            raise RuntimeError("encrypted OEM install but limine.conf has no cryptkey= for auto-unlock")
+            raise RuntimeError("encrypted deferred-provisioning install but limine.conf has no cryptkey= for auto-unlock")
 
 
 def _assert_boot_hooks_restored(ctx: InstallContext) -> None:
@@ -1835,15 +1835,15 @@ def create_factory_snapshot(ctx: InstallContext) -> None:
 # Provisioning credentials staged for THIS deployment's first boot must not
 # survive into the factory image: a reset years later would otherwise hand the
 # next owner the original deployment's SSH keys or rejoin its tailnet, and a
-# stale OEM LUKS key (dead after the first re-key) has no business lingering.
+# stale LUKS key (dead after the first re-key) has no business lingering.
 # The mkinitcpio/cmdline drop-ins go with the keyfile — a reset rebuild would
 # otherwise fail on FILES pointing at a scrubbed path.
 FACTORY_SCRUB_PATHS = (
-    "var/lib/omarchy/oem/authorized_keys",
-    "var/lib/omarchy/oem/luks-key",
-    "etc/omarchy/oem.key",
-    "etc/limine-entry-tool.d/99-omarchy-oem-unlock.conf",
-    "etc/mkinitcpio.conf.d/99-omarchy-oem-key.conf",
+    "var/lib/omarchy/provisioning/authorized_keys",
+    "var/lib/omarchy/provisioning/luks-key",
+    "etc/omarchy/provisioning.key",
+    "etc/limine-entry-tool.d/99-omarchy-provisioning-unlock.conf",
+    "etc/mkinitcpio.conf.d/99-omarchy-provisioning-key.conf",
     "etc/tailscale/authkey",
     "etc/systemd/system/omarchy-tailscale-join.service",
     "etc/systemd/system/multi-user.target.wants/omarchy-tailscale-join.service",

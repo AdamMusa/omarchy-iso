@@ -34,7 +34,7 @@ def build_phases(ctx: InstallContext):
         arch_install_system,
         configure_hibernation,
         run_system_finalizer,
-        stage_oem_state,
+        stage_provisioning_state,
         finalize_limine_boot,
         run_chroot_finalizer,
         configure_dns_resolver,
@@ -51,9 +51,9 @@ def build_phases(ctx: InstallContext):
         ("Installing Arch + Omarchy",  arch_install_system),
         ("Configuring hibernation",    configure_hibernation),
         ("Configuring system",         run_system_finalizer),
-        # Before finalize_limine_boot: the OEM cryptkey drop-in and keyfile
+        # Before finalize_limine_boot: the deferred-provisioning cryptkey drop-in and keyfile
         # must be in place for the final UKI build.
-        ("Staging OEM state",          stage_oem_state),
+        ("Staging provisioning",          stage_provisioning_state),
         ("Finalizing Limine boot",     finalize_limine_boot),
         ("Finalizing user",            run_chroot_finalizer),
         ("Configuring login",          configure_login),
@@ -72,7 +72,7 @@ def main() -> int:
         error(f"Configuration error: {e}")
         return 2
 
-    who = ctx.username or "OEM (user created at first boot)"
+    who = ctx.username or "deferred provisioning (user created at first boot)"
     info(f"Installing Omarchy for {who} → {ctx.target}")
 
     from .phases_impl import (

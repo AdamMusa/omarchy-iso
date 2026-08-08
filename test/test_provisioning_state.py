@@ -1,7 +1,7 @@
-"""Unit tests for OEM install support in the orchestrator.
+"""Unit tests for deferred-provisioning install support in the orchestrator.
 
-Covers the InstallContext OEM plumbing (marker file, credential-less input,
-throwaway LUKS passphrase injection) and the stage_oem_state /
+Covers the InstallContext deferred-provisioning plumbing (marker file, credential-less input,
+throwaway LUKS passphrase injection) and the stage_provisioning_state /
 create_factory_snapshot / configure_login phases against a temp target with
 subprocess mocked out.
 """
@@ -26,7 +26,7 @@ from orchestrator import phases_impl  # noqa: E402
 from orchestrator.context import InstallContext  # noqa: E402
 
 
-class ContextOemTest(unittest.TestCase):
+class ContextDeferProvisioningTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -48,51 +48,51 @@ class ContextOemTest(unittest.TestCase):
     def from_env(self, **extra_env):
         env = {**self.env, **extra_env}
         with mock.patch.dict(os.environ, env, clear=False):
-            for key in ("OMARCHY_INSTALL_OEM_FILE",):
+            for key in ("OMARCHY_INSTALL_DEFER_PROVISIONING_FILE",):
                 if key not in env:
                     os.environ.pop(key, None)
             return InstallContext.from_env()
 
-    def base_config(self, oem=None, disk_encryption=None):
+    def base_config(self, defer_provisioning=None, disk_encryption=None):
         config = {
             "disk_config": {"config_type": "default_layout"},
             "omarchy_install": {"mode": "full_disk", "target_mount": "/mnt"},
         }
-        if oem is not None:
-            config["omarchy_install"]["oem"] = oem
+        if defer_provisioning is not None:
+            config["omarchy_install"]["defer_provisioning"] = defer_provisioning
         if disk_encryption is not None:
             config["disk_config"]["disk_encryption"] = disk_encryption
         return config
 
-    def test_oem_flag_from_config(self):
-        self.write_config(self.base_config(oem=True))
+    def test_defer_provisioning_flag_from_config(self):
+        self.write_config(self.base_config(defer_provisioning=True))
         ctx = self.from_env()
-        self.assertTrue(ctx.oem)
+        self.assertTrue(ctx.defer_provisioning)
         self.assertEqual(ctx.user_credentials, {"users": []})
         self.assertEqual(ctx.username, "")
 
-    def test_oem_marker_file_arms_oem_without_credentials(self):
+    def test_marker_file_arms_deferred_provisioning_without_credentials(self):
         self.write_config(self.base_config())
-        marker = self.dir / "oem"
+        marker = self.dir / "defer_provisioning"
         marker.touch()
-        ctx = self.from_env(OMARCHY_INSTALL_OEM_FILE=str(marker))
-        self.assertTrue(ctx.oem)
-        self.assertTrue(ctx.omarchy_install["oem"])
+        ctx = self.from_env(OMARCHY_INSTALL_DEFER_PROVISIONING_FILE=str(marker))
+        self.assertTrue(ctx.defer_provisioning)
+        self.assertTrue(ctx.omarchy_install["defer_provisioning"])
 
-    def test_absent_marker_file_is_not_oem(self):
+    def test_absent_marker_file_is_not_deferred_provisioning(self):
         self.write_config(self.base_config())
         self.write_creds({"users": [{"username": "jeff"}]})
-        ctx = self.from_env(OMARCHY_INSTALL_OEM_FILE=str(self.dir / "missing-oem"))
-        self.assertFalse(ctx.oem)
+        ctx = self.from_env(OMARCHY_INSTALL_DEFER_PROVISIONING_FILE=str(self.dir / "missing-defer_provisioning"))
+        self.assertFalse(ctx.defer_provisioning)
         self.assertEqual(ctx.username, "jeff")
 
-    def test_missing_credentials_without_oem_raises(self):
+    def test_missing_credentials_without_defer_provisioning_raises(self):
         self.write_config(self.base_config())
         with self.assertRaisesRegex(RuntimeError, "credentials file missing"):
             self.from_env()
 
-    def test_oem_generates_throwaway_luks_passphrase(self):
-        self.write_config(self.base_config(oem=True, disk_encryption={
+    def test_deferred_provisioning_generates_throwaway_luks_passphrase(self):
+        self.write_config(self.base_config(defer_provisioning=True, disk_encryption={
             "encryption_type": "luks", "partitions": ["x"],
         }))
         ctx = self.from_env()
@@ -110,8 +110,8 @@ class ContextOemTest(unittest.TestCase):
         synthesized = json.loads(ctx.creds_path.read_text())
         self.assertEqual(synthesized["encryption_password"], password)
 
-    def test_oem_reuses_rig_supplied_passphrase(self):
-        self.write_config(self.base_config(oem=True, disk_encryption={
+    def test_deferred_provisioning_reuses_rig_supplied_passphrase(self):
+        self.write_config(self.base_config(defer_provisioning=True, disk_encryption={
             "encryption_type": "luks", "partitions": ["x"],
         }))
         self.write_creds({"users": [], "encryption_password": "rig-secret"})
@@ -121,9 +121,9 @@ class ContextOemTest(unittest.TestCase):
             "rig-secret",
         )
 
-    def test_oem_discards_account_material_from_supplied_credentials(self):
+    def test_deferred_provisioning_discards_account_material(self):
         # A rig credentials file must not smuggle in users or a root password.
-        self.write_config(self.base_config(oem=True))
+        self.write_config(self.base_config(defer_provisioning=True))
         self.write_creds({
             "users": [{"username": "backdoor", "enc_password": "x", "sudo": True}],
             "root_enc_password": "x",
@@ -137,8 +137,8 @@ class ContextOemTest(unittest.TestCase):
         self.assertEqual(synthesized["users"], [])
         self.assertNotIn("root_enc_password", synthesized)
 
-    def test_oem_strips_account_fields_from_arch_config(self):
-        config = self.base_config(oem=True)
+    def test_defer_provisioning_strips_account_fields(self):
+        config = self.base_config(defer_provisioning=True)
         config["!users"] = [{"username": "rig"}]
         config["!root-password"] = "hunter2"
         config["root_enc_password"] = "x"
@@ -151,8 +151,8 @@ class ContextOemTest(unittest.TestCase):
             self.assertNotIn(key, arch_config)
         self.assertEqual(arch_config["auth_config"], {})
 
-    def test_oem_unencrypted_touches_nothing(self):
-        self.write_config(self.base_config(oem=True))
+    def test_deferred_provisioning_unencrypted_touches_nothing(self):
+        self.write_config(self.base_config(defer_provisioning=True))
         ctx = self.from_env()
         self.assertNotIn("encryption_password", ctx.user_credentials)
 
@@ -160,10 +160,10 @@ class ContextOemTest(unittest.TestCase):
 def make_ctx(target, **overrides):
     defaults = dict(
         target=target,
-        oem=True,
+        defer_provisioning=True,
         encrypt=False,
         username="",
-        omarchy_install={"mode": "full_disk", "oem": True, "storage": {}},
+        omarchy_install={"mode": "full_disk", "defer_provisioning": True, "storage": {}},
         user_configuration={"disk_config": {}},
         user_credentials={"users": []},
         state_dir=target / "state",
@@ -173,7 +173,7 @@ def make_ctx(target, **overrides):
     return types.SimpleNamespace(**defaults)
 
 
-class StageOemStateTest(unittest.TestCase):
+class StageProvisioningStateTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -192,63 +192,63 @@ class StageOemStateTest(unittest.TestCase):
         node_patch.start()
         self.addCleanup(node_patch.stop)
 
-    def install_runtime_oem_support(self):
-        service = self.target / "usr/share/omarchy/install/oem/omarchy-oem-setup.service"
+    def install_runtime_provisioning_support(self):
+        service = self.target / "usr/share/omarchy/install/provisioning/omarchy-provision-owner.service"
         service.parent.mkdir(parents=True, exist_ok=True)
         service.write_text("[Unit]\n")
-        setup_bin = self.target / "usr/bin/omarchy-oem-setup"
+        setup_bin = self.target / "usr/bin/omarchy-provision-owner"
         setup_bin.parent.mkdir(parents=True, exist_ok=True)
         setup_bin.write_text("#!/bin/bash\n")
 
-    def oem_dir(self):
-        return self.target / "var/lib/omarchy/oem"
+    def provisioning_dir(self):
+        return self.target / "var/lib/omarchy/provisioning"
 
-    def test_non_oem_install_stages_only_the_node_tarball(self):
-        ctx = make_ctx(self.target, oem=False)
-        phases_impl.stage_oem_state(ctx)
+    def test_normal_install_stages_only_the_node_tarball(self):
+        ctx = make_ctx(self.target, defer_provisioning=False)
+        phases_impl.stage_provisioning_state(ctx)
 
-        self.assertTrue((self.oem_dir() / "packages/node-v24.0.0-linux-x64.tar.gz").exists())
-        self.assertFalse((self.oem_dir() / "pending").exists())
-        self.assertFalse((self.target / "etc/systemd/system/omarchy-oem-setup.service").exists())
+        self.assertTrue((self.provisioning_dir() / "packages/node-v24.0.0-linux-x64.tar.gz").exists())
+        self.assertFalse((self.provisioning_dir() / "pending").exists())
+        self.assertFalse((self.target / "etc/systemd/system/omarchy-provision-owner.service").exists())
 
-    def test_oem_against_runtime_without_support_fails_clearly(self):
+    def test_deferred_provisioning_against_runtime_without_support_fails_clearly(self):
         ctx = make_ctx(self.target)
         with self.assertRaisesRegex(RuntimeError, "does not ship"):
-            phases_impl.stage_oem_state(ctx)
+            phases_impl.stage_provisioning_state(ctx)
 
-    def test_oem_without_node_tarball_fails(self):
+    def test_deferred_provisioning_without_node_tarball_fails(self):
         for tarball in self.packages.glob("*.tar.gz"):
             tarball.unlink()
-        self.install_runtime_oem_support()
+        self.install_runtime_provisioning_support()
         ctx = make_ctx(self.target)
         with self.assertRaisesRegex(RuntimeError, "Node tarball"):
-            phases_impl.stage_oem_state(ctx)
+            phases_impl.stage_provisioning_state(ctx)
 
     def test_missing_node_tarball_fails_normal_installs_too(self):
         # The stash is what makes a later factory reset work offline.
         for tarball in self.packages.glob("*.tar.gz"):
             tarball.unlink()
-        ctx = make_ctx(self.target, oem=False)
+        ctx = make_ctx(self.target, defer_provisioning=False)
         with self.assertRaisesRegex(RuntimeError, "Node tarball"):
-            phases_impl.stage_oem_state(ctx)
+            phases_impl.stage_provisioning_state(ctx)
 
-    def test_oem_arms_first_boot_setup(self):
-        self.install_runtime_oem_support()
+    def test_deferred_provisioning_arms_first_boot_setup(self):
+        self.install_runtime_provisioning_support()
         ctx = make_ctx(self.target)
-        phases_impl.stage_oem_state(ctx)
+        phases_impl.stage_provisioning_state(ctx)
 
-        self.assertTrue((self.oem_dir() / "pending").exists())
-        self.assertTrue((self.target / "etc/systemd/system/omarchy-oem-setup.service").exists())
-        link = self.target / "etc/systemd/system/multi-user.target.wants/omarchy-oem-setup.service"
+        self.assertTrue((self.provisioning_dir() / "pending").exists())
+        self.assertTrue((self.target / "etc/systemd/system/omarchy-provision-owner.service").exists())
+        link = self.target / "etc/systemd/system/multi-user.target.wants/omarchy-provision-owner.service"
         self.assertTrue(link.is_symlink())
         self.assertEqual(
-            os.readlink(link), "/etc/systemd/system/omarchy-oem-setup.service"
+            os.readlink(link), "/etc/systemd/system/omarchy-provision-owner.service"
         )
         # Unencrypted: no LUKS staging.
-        self.assertFalse((self.oem_dir() / "luks-key").exists())
+        self.assertFalse((self.provisioning_dir() / "luks-key").exists())
 
-    def test_oem_encrypted_stages_luks_auto_unlock(self):
-        self.install_runtime_oem_support()
+    def test_deferred_provisioning_encrypted_stages_luks_auto_unlock(self):
+        self.install_runtime_provisioning_support()
         ctx = make_ctx(
             self.target,
             user_configuration={"disk_config": {"disk_encryption": {
@@ -256,30 +256,30 @@ class StageOemStateTest(unittest.TestCase):
                 "encryption_password": "throwaway-secret",
             }}},
         )
-        phases_impl.stage_oem_state(ctx)
+        phases_impl.stage_provisioning_state(ctx)
 
         # Byte-for-byte the slot passphrase — no trailing newline.
-        self.assertEqual((self.oem_dir() / "luks-key").read_text(), "throwaway-secret")
-        keyfile = self.target / "etc/omarchy/oem.key"
+        self.assertEqual((self.provisioning_dir() / "luks-key").read_text(), "throwaway-secret")
+        keyfile = self.target / "etc/omarchy/provisioning.key"
         self.assertEqual(keyfile.read_text(), "throwaway-secret")
         self.assertEqual(keyfile.stat().st_mode & 0o777, 0o600)
 
-        cmdline = (self.target / "etc/limine-entry-tool.d/99-omarchy-oem-unlock.conf").read_text()
-        self.assertIn("cryptkey=rootfs:/etc/omarchy/oem.key", cmdline)
-        files = (self.target / "etc/mkinitcpio.conf.d/99-omarchy-oem-key.conf").read_text()
-        self.assertIn("FILES+=(/etc/omarchy/oem.key)", files)
+        cmdline = (self.target / "etc/limine-entry-tool.d/99-omarchy-provisioning-unlock.conf").read_text()
+        self.assertIn("cryptkey=rootfs:/etc/omarchy/provisioning.key", cmdline)
+        files = (self.target / "etc/mkinitcpio.conf.d/99-omarchy-provisioning-key.conf").read_text()
+        self.assertIn("FILES+=(/etc/omarchy/provisioning.key)", files)
 
-    def test_oem_pre_encrypted_without_passphrase_fails(self):
-        self.install_runtime_oem_support()
+    def test_deferred_provisioning_pre_encrypted_without_passphrase_fails(self):
+        self.install_runtime_provisioning_support()
         ctx = make_ctx(
             self.target,
-            omarchy_install={"mode": "protected", "oem": True, "storage": {"luks_uuid": "abc"}},
+            omarchy_install={"mode": "protected", "defer_provisioning": True, "storage": {"luks_uuid": "abc"}},
         )
         with self.assertRaisesRegex(RuntimeError, "passphrase"):
-            phases_impl.stage_oem_state(ctx)
+            phases_impl.stage_provisioning_state(ctx)
 
 
-class ConfigureLoginOemTest(unittest.TestCase):
+class ConfigureLoginDeferProvisioningTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -293,7 +293,7 @@ class ConfigureLoginOemTest(unittest.TestCase):
         run_patch.start()
         self.addCleanup(run_patch.stop)
 
-    def test_oem_login_leaves_user_state_to_first_boot(self):
+    def test_deferred_provisioning_login_leaves_user_state_to_first_boot(self):
         ctx = make_ctx(self.target, encrypt=True)
         phases_impl.configure_login(ctx)
 
@@ -303,7 +303,7 @@ class ConfigureLoginOemTest(unittest.TestCase):
         self.assertTrue(any("sddm.service" in cmd for cmd in self.calls))
 
     def test_normal_encrypted_login_still_autologs_in(self):
-        ctx = make_ctx(self.target, oem=False, encrypt=True, username="jeff")
+        ctx = make_ctx(self.target, defer_provisioning=False, encrypt=True, username="jeff")
         phases_impl.configure_login(ctx)
 
         autologin = (self.target / "etc/sddm.conf.d/autologin.conf").read_text()
@@ -312,7 +312,7 @@ class ConfigureLoginOemTest(unittest.TestCase):
         self.assertIn("User=jeff", state)
 
 
-class ConfigureSshAccessOemTest(unittest.TestCase):
+class ConfigureSshAccessDeferProvisioningTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -336,14 +336,14 @@ class ConfigureSshAccessOemTest(unittest.TestCase):
         run_patch.start()
         self.addCleanup(run_patch.stop)
 
-    def test_oem_stages_keys_for_first_boot(self):
+    def test_deferred_provisioning_stages_keys_for_first_boot(self):
         keys = Path(self.tmp.name) / "authorized_keys"
         keys.write_text("ssh-ed25519 AAAA rig@host\n")
         ctx = make_ctx(self.target, authorized_keys_path=keys)
 
         phases_impl.configure_ssh_access(ctx)
 
-        staged = self.target / "var/lib/omarchy/oem/authorized_keys"
+        staged = self.target / "var/lib/omarchy/provisioning/authorized_keys"
         self.assertEqual(staged.read_text(), "ssh-ed25519 AAAA rig@host\n")
         self.assertEqual(staged.stat().st_mode & 0o777, 0o600)
         # No user yet — nothing under /home, no chown.
@@ -387,7 +387,7 @@ class CreateFactorySnapshotTest(unittest.TestCase):
         self.addCleanup(run_patch.stop)
 
     def ctx(self):
-        return make_ctx(self.target, oem=False, state_dir=self.state_dir)
+        return make_ctx(self.target, defer_provisioning=False, state_dir=self.state_dir)
 
     def test_snapshots_root_as_factory(self):
         phases_impl.create_factory_snapshot(self.ctx())
@@ -410,11 +410,11 @@ class CreateFactorySnapshotTest(unittest.TestCase):
         top = self.state_dir / "factory-top"
         factory = top / "@factory"
         secrets = [
-            factory / "var/lib/omarchy/oem/authorized_keys",
+            factory / "var/lib/omarchy/provisioning/authorized_keys",
             factory / "etc/tailscale/authkey",
-            factory / "etc/omarchy/oem.key",
+            factory / "etc/omarchy/provisioning.key",
         ]
-        keep = factory / "var/lib/omarchy/oem/groups"
+        keep = factory / "var/lib/omarchy/provisioning/groups"
         for path in [*secrets, keep]:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("secret")

@@ -26,7 +26,7 @@ class InstallContext:
     user_credentials: dict
     arch_config_path: Path
     omarchy_install: dict[str, Any]
-    oem: bool = False
+    defer_provisioning: bool = False
 
     target: Path = Path("/mnt")
     omarchy_path: Path = Path("/usr/share/omarchy")
@@ -50,23 +50,23 @@ class InstallContext:
         user_configuration = json.loads(config_path.read_text())
         omarchy_install = user_configuration.get("omarchy_install") or _default_omarchy_install(user_configuration)
 
-        # OEM mode: the whole system installs but user creation is deferred to
-        # first boot. Selected by the configurator (omarchy_install.oem) or by
-        # an `oem` marker file on an autoinstall drive, which also replaces the
+        # Deferred provisioning: the whole system installs but user creation is deferred to
+        # first boot. Selected by the configurator (omarchy_install.defer_provisioning) or by
+        # an `defer-provisioning` marker file on an autoinstall drive, which also replaces the
         # user_credentials.json requirement.
-        oem_marker = _optional_path(os.environ.get("OMARCHY_INSTALL_OEM_FILE"))
-        oem = bool(omarchy_install.get("oem")) or oem_marker is not None
-        omarchy_install["oem"] = oem
+        defer_provisioning_marker = _optional_path(os.environ.get("OMARCHY_INSTALL_DEFER_PROVISIONING_FILE"))
+        defer_provisioning = bool(omarchy_install.get("defer_provisioning")) or defer_provisioning_marker is not None
+        omarchy_install["defer_provisioning"] = defer_provisioning
 
         if creds_path.exists():
             user_credentials = json.loads(creds_path.read_text())
-        elif oem:
+        elif defer_provisioning:
             user_credentials = {"users": []}
         else:
             raise RuntimeError(f"credentials file missing: {creds_path}")
 
-        if oem:
-            # OEM promises no account exists until first boot. A supplied
+        if defer_provisioning:
+            # Deferred provisioning promises no account until first boot. A supplied
             # credentials file (a rig handing over its LUKS passphrase) must
             # not smuggle in users or a root password.
             encryption_password = user_credentials.get("encryption_password")
@@ -77,7 +77,7 @@ class InstallContext:
         arch_configuration = dict(user_configuration)
         arch_configuration.pop("omarchy_install", None)
 
-        if oem:
+        if defer_provisioning:
             # The userless invariant covers the archinstall config too: a
             # combined/legacy config could carry account authentication that
             # archinstall would still act on (users, a root password). Strip
@@ -87,14 +87,14 @@ class InstallContext:
         state_dir = Path(os.environ.get("OMARCHY_INSTALL_STATE_DIR", "/run/omarchy-install"))
         state_dir.mkdir(parents=True, exist_ok=True)
 
-        if oem:
-            # Encrypted OEM installs have no user password to protect LUKS
+        if defer_provisioning:
+            # Encrypted deferred-provisioning installs have no user password to protect LUKS
             # with. Generate a throwaway passphrase (staged for first-boot
-            # re-key by the stage_oem_state phase) and hand it to archinstall
+            # re-key by the stage_provisioning_state phase) and hand it to archinstall
             # through both places it may look: the disk_encryption block and
             # the credentials file.
-            _inject_oem_encryption_password(arch_configuration, user_credentials)
-            creds_path = state_dir / "oem-user_credentials.json"
+            _inject_provisioning_encryption_password(arch_configuration, user_credentials)
+            creds_path = state_dir / "provisioning-user_credentials.json"
             creds_path.write_text(json.dumps(user_credentials, indent=2) + "\n")
             creds_path.chmod(0o600)
 
@@ -113,7 +113,7 @@ class InstallContext:
             user_credentials=user_credentials,
             arch_config_path=arch_config_path,
             omarchy_install=omarchy_install,
-            oem=oem,
+            defer_provisioning=defer_provisioning,
             state_dir=state_dir,
         )
         disk_config = user_configuration.get("disk_config", {})
@@ -127,7 +127,7 @@ class InstallContext:
         users = self.user_credentials.get("users") or []
         if users:
             return users[0]["username"]
-        if self.oem:
+        if self.defer_provisioning:
             return ""
         raise RuntimeError("user_credentials.json contains no users")
 
@@ -145,7 +145,7 @@ class InstallContext:
 
 def _strip_account_fields(arch_configuration: dict) -> None:
     """Remove every field archinstall reads to create users or set a root
-    password, so an OEM install cannot ship a hidden provisioning account.
+    password, so it cannot ship a hidden provisioning account.
     Encryption material lives elsewhere (disk_config.disk_encryption) and is
     untouched."""
     for key in ("!users", "!root-password", "root_enc_password", "users"):
@@ -157,12 +157,12 @@ def _strip_account_fields(arch_configuration: dict) -> None:
             auth.pop(key, None)
 
 
-def _inject_oem_encryption_password(arch_configuration: dict, user_credentials: dict) -> None:
-    """Ensure an encrypted OEM install has a LUKS passphrase archinstall can
+def _inject_provisioning_encryption_password(arch_configuration: dict, user_credentials: dict) -> None:
+    """Ensure an encrypted deferred-provisioning install has a LUKS passphrase archinstall can
     use. Reuse one the input already carries (an autoinstall rig may supply
     its own); otherwise generate a throwaway. Mutates the disk_encryption
     block in place — arch_configuration shares it with user_configuration, so
-    the stage_oem_state phase can read the effective passphrase back."""
+    the stage_provisioning_state phase can read the effective passphrase back."""
     disk_encryption = (arch_configuration.get("disk_config") or {}).get("disk_encryption")
     if disk_encryption is None:
         return

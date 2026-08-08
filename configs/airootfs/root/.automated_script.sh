@@ -118,4 +118,4 @@ rm -f /run/omarchy-install/state.json
     --encrypt-file /root/user_encrypt_installation.txt \
     --authorized-keys-file /root/authorized_keys \
     --tailscale-authkey-file /root/tailscale_authkey \
-    --oem-file /root/oem
+    --defer-provisioning-file /root/defer-provisioning

@@ -75,13 +75,13 @@ notice() {
 keyboard_form() {
   # The Ctrl+C hint sits directly under the header (no blank line between),
   # matching the disk-overwrite screen's unencrypted offer. Ctrl+C on the first
-  # screen is the hidden entry into OEM mode; $1 is "true" only for that first
-  # invocation, so the review-loop re-edit can't flip a user install into OEM.
-  local allow_oem="${1:-false}"
+  # screen is the hidden entry into deferred provisioning; $1 is "true" only for that first
+  # invocation, so the review-loop re-edit can't flip a user install into it.
+  local allow_defer_provisioning="${1:-false}"
   clear_logo
   echo
   say "Let's setup your machine..."
-  if $allow_oem; then
+  if $allow_defer_provisioning; then
     say --foreground 8 "Press Ctrl+C to prepare this machine for another owner."
   fi
   echo
@@ -139,9 +139,9 @@ Ukrainian|ua'
   choice=$(printf '%s\n' "$keyboards" | cut -d'|' -f1 | gum choose --height 10 --selected "English (US)" --header "Select keyboard layout")
   local status=$?
 
-  if $allow_oem && (( status == 130 )); then
+  if $allow_defer_provisioning && (( status == 130 )); then
     if confirm_prepare_for_another_owner; then
-      oem_install=true
+      defer_provisioning=true
       return 0
     fi
     keyboard_form true # declined: back to the keyboard picker
@@ -171,9 +171,9 @@ confirm_prepare_for_another_owner() {
     "Prepare this machine for another owner?"
 }
 
-# The user step. OEM installs skip it entirely — the machine's first owner
+# The user step. Deferred-provisioning installs skip it entirely — the machine's first owner
 # picks their keyboard and creates their user in the first-boot setup, so the
-# OEM operator sets nothing user-specific.
+# operator sets nothing user-specific.
 
 user_form() {
   step "Let's setup your user account..."
@@ -386,14 +386,14 @@ wait_for_device() {
 
 # Save the configurator answers the installer consumes: git identity and
 # encryption choice as plain files, account details as archinstall credentials.
-# OEM installs defer the user to first boot: no credentials, and on encrypted
+# Deferred-provisioning installs defer the user to first boot: no credentials, and on encrypted
 # targets the orchestrator generates a throwaway LUKS passphrase itself.
 write_user_files() {
   echo "$full_name" >user_full_name.txt
   echo "$email_address" >user_email_address.txt
   printf '%s\n' "$encrypt_installation" >user_encrypt_installation.txt
 
-  if $oem_install; then
+  if $defer_provisioning; then
     cat <<-_EOF_ >user_credentials.json
 {
     "users": []
@@ -895,7 +895,7 @@ confirm_disk_overwrite() {
 
 # Decide what and how to install: sets install_target (full_disk|free_space),
 # install_target and encrypt_installation. Nothing is written to disk yet —
-# the user step runs between this and the execution below. (OEM mode never
+# the user step runs between this and the execution below. (deferred provisioning never
 # reaches here; it's armed by Ctrl+C on the first screen and goes straight to
 # disk selection.)
 select_installation() {
@@ -939,15 +939,15 @@ select_installation() {
   done
 }
 
-# STEP 1: KEYBOARD (Ctrl+C here arms OEM mode and jumps to disk selection)
+# STEP 1: KEYBOARD (Ctrl+C here arms deferred provisioning and jumps to disk selection)
 
-oem_install=false
+defer_provisioning=false
 install_target="full_disk"
 
 keyboard_form true
 
-if $oem_install; then
-  # OEM: no user setup, and the keyboard is deferred to the machine's first
+if $defer_provisioning; then
+  # Deferred provisioning: no user setup, and the keyboard is deferred to the machine's first
   # boot. A defined default keymap so it boots before then; the owner picks
   # their real layout in the OOBE, which re-keys the console and, on encrypted
   # installs, rebuilds the initramfs so the LUKS prompt matches.
@@ -961,7 +961,7 @@ if $oem_install; then
   timezone="UTC"
 
   # Jump straight to disk selection + overwrite confirmation (encrypted by
-  # default, Ctrl+C toggles unencrypted). OEM is always a full-disk install.
+  # default, Ctrl+C toggles unencrypted). deferred provisioning is always a full-disk install.
   disk_form
   until confirm_disk_overwrite; do
     disk_form
@@ -1005,9 +1005,9 @@ main_partition_size=$((disk_size_in_mib - main_partition_start - gpt_backup_rese
 kernel_choice=$(detect_kernel)
 
 if [[ $encrypt_installation == true ]]; then
-  # OEM installs carry no password: the orchestrator generates a throwaway
+  # Deferred-provisioning installs carry no password: the orchestrator generates a throwaway
   # LUKS passphrase and stages it for the first-boot re-key.
-  if $oem_install; then
+  if $defer_provisioning; then
     encryption_password_line=""
   else
     encryption_password_line=",
@@ -1037,7 +1037,7 @@ cat <<-_EOF_ >user_configuration.json
     "custom_commands": [],
     "omarchy_install": {
         "mode": "full_disk",
-        "oem": $oem_install,
+        "defer_provisioning": $defer_provisioning,
         "target_mount": "/mnt",
         "boot": {
             "esp_mount": "/boot",

@@ -124,56 +124,56 @@ run_load || fail "required pair plus authorized_keys loads"
 [[ ! -e $sandbox/root/tailscale_authkey ]] || fail "absent tailscale_authkey is not copied"
 pass "present optional files are copied, absent ones skipped"
 
-# An oem marker replaces user_credentials.json: OEM installs defer user
+# A defer-provisioning marker replaces user_credentials.json: deferred-provisioning installs
 # creation to first boot, so imaging rigs ship no credentials at all.
 new_sandbox
 attach_drive cidata
 echo '{"disk_config": {}}' >"$sandbox/media/user_configuration.json"
-: >"$sandbox/media/oem"
-run_load || fail "config plus oem marker loads"
-[[ -f $sandbox/root/oem ]] || fail "oem marker is copied"
-[[ ! -e $sandbox/root/user_credentials.json ]] || fail "oem drive copies no credentials"
-pass "oem marker stands in for credentials"
+: >"$sandbox/media/defer-provisioning"
+run_load || fail "config plus defer-provisioning marker loads"
+[[ -f $sandbox/root/defer-provisioning ]] || fail "defer-provisioning marker is copied"
+[[ ! -e $sandbox/root/user_credentials.json ]] || fail "defer-provisioning drive copies no credentials"
+pass "defer-provisioning marker stands in for credentials"
 
-# The oem marker and credentials can coexist (rig supplies its own LUKS
+# The defer-provisioning marker and credentials can coexist (rig supplies its own LUKS
 # passphrase in the credentials file); both are copied.
 new_sandbox
 attach_drive cidata
 write_required_pair
-: >"$sandbox/media/oem"
-run_load || fail "oem marker plus credentials loads"
-[[ -f $sandbox/root/oem && -f $sandbox/root/user_credentials.json ]] || fail "both oem marker and credentials are copied"
-pass "oem marker plus credentials copies both"
+: >"$sandbox/media/defer-provisioning"
+run_load || fail "defer-provisioning marker plus credentials loads"
+[[ -f $sandbox/root/defer-provisioning && -f $sandbox/root/user_credentials.json ]] || fail "both defer-provisioning marker and credentials are copied"
+pass "defer-provisioning marker plus credentials copies both"
 
-# An oem marker without the configuration is still not an autoinstall drive.
+# An defer-provisioning marker without the configuration is still not an autoinstall drive.
 new_sandbox
 attach_drive cidata
-: >"$sandbox/media/oem"
-! run_load || fail "oem marker alone is not an autoinstall drive"
-[[ ! -e $sandbox/root/oem ]] || fail "oem marker alone copies nothing"
-pass "oem marker alone falls back to the wizard"
+: >"$sandbox/media/defer-provisioning"
+! run_load || fail "defer-provisioning marker alone is not an autoinstall drive"
+[[ ! -e $sandbox/root/defer-provisioning ]] || fail "defer-provisioning marker alone copies nothing"
+pass "defer-provisioning marker alone falls back to the wizard"
 
-# Stale OEM inputs from a previous load in the same session are cleared before
-# the current drive is copied: a normal drive must not inherit an old oem
+# Stale deferred-provisioning inputs from a previous load in the same session are cleared before
+# the current drive is copied: a normal drive must not inherit an old defer-provisioning
 # marker or credentials.
 new_sandbox
 attach_drive cidata
 write_required_pair
-: >"$sandbox/root/oem"                       # leftover from a prior OEM load
+: >"$sandbox/root/defer-provisioning"                       # leftover from a prior deferred-provisioning load
 echo 'old-keys' >"$sandbox/root/authorized_keys"
-run_load || fail "normal drive after a stale OEM load loads"
-[[ ! -e $sandbox/root/oem ]] || fail "stale oem marker is cleared"
+run_load || fail "normal drive after a stale defer-provisioning load loads"
+[[ ! -e $sandbox/root/defer-provisioning ]] || fail "stale defer-provisioning marker is cleared"
 [[ ! -e $sandbox/root/authorized_keys ]] || fail "stale optional inputs are cleared"
-pass "stale OEM inputs are cleared before loading a normal drive"
+pass "stale deferred-provisioning inputs are cleared before loading a normal drive"
 
 # A drive that isn't an autoinstall drive at all still clears stale inputs so
 # the wizard that follows doesn't inherit them.
 new_sandbox
 attach_drive cidata
 echo '{"disk_config": {}}' >"$sandbox/media/user_configuration.json" # half a pair
-: >"$sandbox/root/oem"
+: >"$sandbox/root/defer-provisioning"
 ! run_load || fail "half-pair drive still falls back"
-[[ ! -e $sandbox/root/oem ]] || fail "stale oem marker cleared even on fallback"
+[[ ! -e $sandbox/root/defer-provisioning ]] || fail "stale defer-provisioning marker cleared even on fallback"
 pass "stale inputs are cleared even when falling back to the wizard"
 
 # Half the required pair is not an autoinstall drive: unmount and fall back.
