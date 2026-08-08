@@ -612,22 +612,22 @@ drive_configurator() {
   capture_console "success-installer-01-keyboard-layout"
 
   if $OEM; then
-    press ctrl-c # arm OEM mode
-    wait_for_screen "new owner" 30
-    capture_console "success-installer-02-oem-confirm"
-    press ret # "Yes, prepare for a new owner" is the affirmative default
+    press ctrl-c # arm "prepare for another owner"
+    wait_for_screen "another owner" 30
+    capture_console "success-installer-02-prepare-confirm"
+    press ret # "Yes, prepare for another owner" is the affirmative default
 
-    # OEM jumps straight to disk selection, then the overwrite confirm.
+    # Jumps straight to disk selection, then the overwrite confirm.
     wait_for_screen "install disk" 60
-    capture_console "success-installer-03-oem-install-disk"
+    capture_console "success-installer-03-prepare-install-disk"
     press ret
 
     wait_for_screen "recovery possible" 60
-    capture_console "success-installer-04-oem-disk-warning-encrypted"
+    capture_console "success-installer-04-prepare-disk-warning-encrypted"
     if ! $ENCRYPT; then
       press ctrl-c
       wait_for_screen "without encryption" 30
-      capture_console "success-installer-05-oem-disk-warning-unencrypted"
+      capture_console "success-installer-05-prepare-disk-warning-unencrypted"
     fi
     press ret
     sleep 2
@@ -637,61 +637,62 @@ drive_configurator() {
 
   press ret # English (US) is preselected
 
-  wait_for_screen "install disk" 60
-  capture_console "success-installer-02-install-disk"
-  press ret # the single virtio disk
-
-  wait_for_screen "installation mode\|recovery possible" 60
-  if ocr_screen | grep -qi "installation mode"; then
-    capture_console "success-installer-03-install-mode"
-    press ret # "Full disk install" is preselected
-  fi
-
-  wait_for_screen "recovery possible" 60
-  capture_console "success-installer-04-disk-warning-encrypted"
-  if ! $ENCRYPT; then
-    press ctrl-c # toggles the confirm to the unencrypted flow
-    wait_for_screen "without encryption" 30
-    capture_console "success-installer-05-disk-warning-unencrypted"
-  fi
-  press ret
-
+  # Normal flow: user step comes before disk selection.
   wait_for_screen "Username" 120
   type_text "$GUEST_USER"
-  capture_console "success-installer-06-username"
+  capture_console "success-installer-02-username"
   press ret
 
   wait_for_screen "Password" 60
   type_text "$GUEST_PASSWORD"
-  capture_console "success-installer-07-password"
+  capture_console "success-installer-03-password"
   press ret
 
   wait_for_screen "Must match" 60
   type_text "$GUEST_PASSWORD"
-  capture_console "success-installer-08-password-confirmation"
+  capture_console "success-installer-04-password-confirmation"
   press ret
 
   wait_for_screen "Full name" 60
   type_text "Omarchy Test"
-  capture_console "success-installer-09-full-name"
+  capture_console "success-installer-05-full-name"
   press ret
 
   wait_for_screen "Email address" 60
   type_text "test@omarchy.org"
-  capture_console "success-installer-10-email"
+  capture_console "success-installer-06-email"
   press ret
 
   wait_for_screen "Hostname" 60
   type_text "$GUEST_HOSTNAME"
-  capture_console "success-installer-11-hostname"
+  capture_console "success-installer-07-hostname"
   press ret
 
   wait_for_screen "Timezone" 180 # tzupdate geo-guess can take a moment
-  capture_console "success-installer-12-timezone"
+  capture_console "success-installer-08-timezone"
   press ret
 
   wait_for_screen "look right" 60
-  capture_console "success-installer-13-review"
+  capture_console "success-installer-09-review"
+  press ret
+
+  wait_for_screen "install disk" 60
+  capture_console "success-installer-10-install-disk"
+  press ret # the single virtio disk
+
+  wait_for_screen "installation mode\|recovery possible" 60
+  if ocr_screen | grep -qi "installation mode"; then
+    capture_console "success-installer-11-install-mode"
+    press ret # "Full disk install" is preselected
+  fi
+
+  wait_for_screen "recovery possible" 60
+  capture_console "success-installer-12-disk-warning-encrypted"
+  if ! $ENCRYPT; then
+    press ctrl-c # toggles the confirm to the unencrypted flow
+    wait_for_screen "without encryption" 30
+    capture_console "success-installer-13-disk-warning-unencrypted"
+  fi
   press ret
 
   sleep 2

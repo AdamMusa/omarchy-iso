@@ -81,7 +81,7 @@ keyboard_form() {
   # Ctrl+C there can't flip an in-progress user install into OEM.
   local allow_oem="${1:-false}"
   if $allow_oem; then
-    say --foreground 8 "Press Ctrl+C to prepare this machine for a new owner (OEM install)."
+    say --foreground 8 "Press Ctrl+C to prepare this machine for another owner."
     echo
   fi
 
@@ -139,11 +139,11 @@ Ukrainian|ua'
   local status=$?
 
   if $allow_oem && (( status == 130 )); then
-    if confirm_oem_install; then
+    if confirm_prepare_for_another_owner; then
       oem_install=true
       return 0
     fi
-    keyboard_form true # declined OEM: back to the keyboard picker
+    keyboard_form true # declined: back to the keyboard picker
     return
   fi
   (( status == 0 )) || abort
@@ -157,17 +157,18 @@ Ukrainian|ua'
   fi
 }
 
-# Ctrl+C on the first screen offers OEM mode. Confirm it before committing, so
-# an accidental Ctrl+C doesn't silently switch the whole install.
-confirm_oem_install() {
+# Ctrl+C on the first screen offers to prepare the machine for another owner.
+# Confirm it before committing, so an accidental Ctrl+C doesn't silently switch
+# the whole install.
+confirm_prepare_for_another_owner() {
   clear_logo
   echo
-  say "OEM install prepares this machine for someone else."
-  say --foreground 8 "The system installs now, but the new owner picks their keyboard and"
-  say --foreground 8 "creates their user on the machine's first boot."
+  say "This prepares the machine for another owner."
+  say --foreground 8 "The system installs now, but they pick their keyboard and create"
+  say --foreground 8 "their user on the machine's first boot."
   echo
-  gum confirm --affirmative "Yes, prepare for a new owner" --negative "No, keep setting up" \
-    "Prepare this machine for a new owner?"
+  gum confirm --affirmative "Yes, prepare for another owner" --negative "No, keep setting up" \
+    "Prepare this machine for another owner?"
 }
 
 # The user step. OEM installs skip it entirely — the machine's first owner
@@ -958,12 +959,12 @@ if $oem_install; then
   done
   install_target="full_disk"
 else
-  # Normal install: pick the disk, then the install mode, then the user. The
+  # Normal install: keyboard (done above) → user → disk → install mode. The
   # keyboard chosen above is already loaded, so the LUKS passphrase entered in
   # the user step is typed under the right layout.
+  user_step
   disk_form
   select_installation
-  user_step
 fi
 
 clear
