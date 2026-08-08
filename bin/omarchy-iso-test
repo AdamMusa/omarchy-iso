@@ -703,7 +703,7 @@ drive_oem_setup() {
   capture_console "success-oem-02-password"
   press ret
 
-  wait_for_screen "Confirm" 60
+  wait_for_screen "Conf *irm" 60
   type_text "$GUEST_PASSWORD"
   press ret
 
@@ -931,6 +931,25 @@ install_phase() {
     unlock_luks
   fi
   bootstrap_ssh
+
+  # SSH can come up (console bootstrap logs in on a spare TTY) while
+  # omarchy-oem-setup is still finalizing the user and re-keying LUKS. Saving
+  # the base mid-finalization produces a flaky image, so wait for the pending
+  # flag to clear before powering off.
+  if $OEM; then
+    log "Waiting for OEM first-boot setup to finish"
+    local waited=0
+    while ssh_guest "test -f /var/lib/omarchy/oem/pending" 2>/dev/null; do
+      if ((waited >= 900)); then
+        capture_console "failure-oem-finalization-timeout"
+        echo "Timed out waiting for OEM first-boot setup to complete" >&2
+        return 1
+      fi
+      sleep 10
+      ((waited += 10))
+    done
+    capture_console "success-oem-06-setup-complete"
+  fi
 
   ssh_guest "echo $GUEST_PASSWORD | sudo -S cat /var/log/omarchy-install-timing.json 2>/dev/null" \
     >"$RUN_DIR/omarchy-install-timing.json" 2>/dev/null || true

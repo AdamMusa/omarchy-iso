@@ -38,10 +38,20 @@ done
 mkdir -p "$mnt"
 mount -o ro "$device" "$mnt" || exit 1
 
+# Clear any inputs a previous load in this live session left in /root before
+# copying the current drive: a stale `oem` marker or credentials file would
+# otherwise force a fresh drive's config back into OEM mode or hand it an old
+# LUKS passphrase. The interactive wizard writes these same names, but a
+# cidata load always precedes it, so nothing of the user's is discarded here.
+optional_inputs=(user_credentials.json oem user_full_name.txt user_email_address.txt user_encrypt_installation.txt authorized_keys tailscale_authkey)
+for file in user_configuration.json "${optional_inputs[@]}"; do
+  rm -f "$dest/$file"
+done
+
 loaded=1
 if [[ -f $mnt/user_configuration.json ]] && [[ -f $mnt/user_credentials.json || -f $mnt/oem ]]; then
   files=("$mnt"/user_configuration.json)
-  for file in user_credentials.json oem user_full_name.txt user_email_address.txt user_encrypt_installation.txt authorized_keys tailscale_authkey; do
+  for file in "${optional_inputs[@]}"; do
     [[ -f $mnt/$file ]] && files+=("$mnt/$file")
   done
   if cp "${files[@]}" "$dest"/; then

@@ -137,6 +137,20 @@ class ContextOemTest(unittest.TestCase):
         self.assertEqual(synthesized["users"], [])
         self.assertNotIn("root_enc_password", synthesized)
 
+    def test_oem_strips_account_fields_from_arch_config(self):
+        config = self.base_config(oem=True)
+        config["!users"] = [{"username": "rig"}]
+        config["!root-password"] = "hunter2"
+        config["root_enc_password"] = "x"
+        config["auth_config"] = {"users": [{"username": "rig"}], "root_enc_password": "x"}
+        self.write_config(config)
+        ctx = self.from_env()
+
+        arch_config = json.loads(ctx.arch_config_path.read_text())
+        for key in ("!users", "!root-password", "root_enc_password", "users"):
+            self.assertNotIn(key, arch_config)
+        self.assertEqual(arch_config["auth_config"], {})
+
     def test_oem_unencrypted_touches_nothing(self):
         self.write_config(self.base_config(oem=True))
         ctx = self.from_env()

@@ -153,6 +153,29 @@ attach_drive cidata
 [[ ! -e $sandbox/root/oem ]] || fail "oem marker alone copies nothing"
 pass "oem marker alone falls back to the wizard"
 
+# Stale OEM inputs from a previous load in the same session are cleared before
+# the current drive is copied: a normal drive must not inherit an old oem
+# marker or credentials.
+new_sandbox
+attach_drive cidata
+write_required_pair
+: >"$sandbox/root/oem"                       # leftover from a prior OEM load
+echo 'old-keys' >"$sandbox/root/authorized_keys"
+run_load || fail "normal drive after a stale OEM load loads"
+[[ ! -e $sandbox/root/oem ]] || fail "stale oem marker is cleared"
+[[ ! -e $sandbox/root/authorized_keys ]] || fail "stale optional inputs are cleared"
+pass "stale OEM inputs are cleared before loading a normal drive"
+
+# A drive that isn't an autoinstall drive at all still clears stale inputs so
+# the wizard that follows doesn't inherit them.
+new_sandbox
+attach_drive cidata
+echo '{"disk_config": {}}' >"$sandbox/media/user_configuration.json" # half a pair
+: >"$sandbox/root/oem"
+! run_load || fail "half-pair drive still falls back"
+[[ ! -e $sandbox/root/oem ]] || fail "stale oem marker cleared even on fallback"
+pass "stale inputs are cleared even when falling back to the wizard"
+
 # Half the required pair is not an autoinstall drive: unmount and fall back.
 new_sandbox
 attach_drive cidata

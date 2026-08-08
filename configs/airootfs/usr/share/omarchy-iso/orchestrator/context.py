@@ -76,6 +76,14 @@ class InstallContext:
 
         arch_configuration = dict(user_configuration)
         arch_configuration.pop("omarchy_install", None)
+
+        if oem:
+            # The userless invariant covers the archinstall config too: a
+            # combined/legacy config could carry account authentication that
+            # archinstall would still act on (users, a root password). Strip
+            # every such field so no account is created before first boot.
+            _strip_account_fields(arch_configuration)
+
         state_dir = Path(os.environ.get("OMARCHY_INSTALL_STATE_DIR", "/run/omarchy-install"))
         state_dir.mkdir(parents=True, exist_ok=True)
 
@@ -133,6 +141,20 @@ class InstallContext:
     @property
     def is_protected(self) -> bool:
         return self.mode == "protected"
+
+
+def _strip_account_fields(arch_configuration: dict) -> None:
+    """Remove every field archinstall reads to create users or set a root
+    password, so an OEM install cannot ship a hidden provisioning account.
+    Encryption material lives elsewhere (disk_config.disk_encryption) and is
+    untouched."""
+    for key in ("!users", "!root-password", "root_enc_password", "users"):
+        arch_configuration.pop(key, None)
+
+    auth = arch_configuration.get("auth_config")
+    if isinstance(auth, dict):
+        for key in ("users", "root_enc_password"):
+            auth.pop(key, None)
 
 
 def _inject_oem_encryption_password(arch_configuration: dict, user_credentials: dict) -> None:
