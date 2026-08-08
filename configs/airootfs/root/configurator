@@ -38,6 +38,33 @@ measure_terminal() {
 }
 measure_terminal
 
+# The live VT resizes late during boot: tty1 starts as the 80-column boot
+# console and only grows once the kernel framebuffer/KMS takes over (noticeably
+# late in VMs). The logo is wider than 80 columns, so a first draw against that
+# transient narrow console wraps the logo ("smushed") and can't center it
+# (padding clamps to 0, so it hugs the left). Every later screen re-measures and
+# looks right, so this only bites the very first screen. Hold that first draw
+# until the width settles at (or above) the logo width. Terminal emulators (dry
+# runs) are already at final size, so skip them; a real VT that never widens
+# (e.g. nomodeset) still proceeds after the cap rather than hanging.
+wait_for_stable_terminal() {
+  [[ $(tty 2>/dev/null) == /dev/tty* ]] || return 0
+
+  local width last="" stable=0 waited=0
+  while (( waited < 5000 )); do
+    width=$(stty size 2>/dev/null </dev/tty | awk '{print $2}')
+    [[ $width =~ ^[0-9]+$ ]] || width=0
+    if [[ $width == "$last" ]] && (( width >= LOGO_WIDTH )); then
+      (( ++stable >= 3 )) && break
+    else
+      stable=0
+    fi
+    last=$width
+    sleep 0.2
+    (( waited += 200 ))
+  done
+}
+
 clear_logo() {
   measure_terminal
   printf "\033[H\033[2J"
@@ -943,6 +970,10 @@ select_installation() {
 
 defer_provisioning=false
 install_target="full_disk"
+
+# Let the live VT reach its settled width before the first screen so the logo
+# isn't measured against the transient 80-column boot console.
+wait_for_stable_terminal
 
 keyboard_form true
 
