@@ -74,6 +74,17 @@ notice() {
 
 keyboard_form() {
   step "Let's setup your machine..."
+
+  # On the first screen, Ctrl+C is the hidden entry into OEM mode — the same
+  # idiom the disk-overwrite screen uses for unencrypted. $1 is "true" only for
+  # that first invocation; the review-loop re-edit passes nothing so a stray
+  # Ctrl+C there can't flip an in-progress user install into OEM.
+  local allow_oem="${1:-false}"
+  if $allow_oem; then
+    say --foreground 8 "Press Ctrl+C to prepare this machine for a new owner (OEM install)."
+    echo
+  fi
+
   keyboards=$'Azerbaijani|azerty
 Belarusian|by
 Belgian|be-latin1
@@ -124,7 +135,19 @@ Swedish|sv-latin1
 Tajik|tj_alt-UTF8
 Turkish|trq
 Ukrainian|ua'
-  choice=$(printf '%s\n' "$keyboards" | cut -d'|' -f1 | gum choose --height 10 --selected "English (US)" --header "Select keyboard layout") || abort
+  choice=$(printf '%s\n' "$keyboards" | cut -d'|' -f1 | gum choose --height 10 --selected "English (US)" --header "Select keyboard layout")
+  local status=$?
+
+  if $allow_oem && (( status == 130 )); then
+    if confirm_oem_install; then
+      oem_install=true
+      return 0
+    fi
+    keyboard_form true # declined OEM: back to the keyboard picker
+    return
+  fi
+  (( status == 0 )) || abort
+
   keyboard=$(printf '%s\n' "$keyboards" | awk -F'|' -v c="$choice" '$1==c{print $2; exit}')
 
   # Only attempt to load keyboard layout if we're on a real console
@@ -134,9 +157,22 @@ Ukrainian|ua'
   fi
 }
 
-# Keyboard and user run after the install mode is chosen. OEM installs skip
-# both — the machine's first owner picks their keyboard and creates their user
-# in the first-boot setup, so the OEM operator sets nothing user-specific.
+# Ctrl+C on the first screen offers OEM mode. Confirm it before committing, so
+# an accidental Ctrl+C doesn't silently switch the whole install.
+confirm_oem_install() {
+  clear_logo
+  echo
+  say "OEM install prepares this machine for someone else."
+  say --foreground 8 "The system installs now, but the new owner picks their keyboard and"
+  say --foreground 8 "creates their user on the machine's first boot."
+  echo
+  gum confirm --affirmative "Yes, prepare for a new owner" --negative "No, keep setting up" \
+    "Prepare this machine for a new owner?"
+}
+
+# The user step. OEM installs skip it entirely — the machine's first owner
+# picks their keyboard and creates their user in the first-boot setup, so the
+# OEM operator sets nothing user-specific.
 
 user_form() {
   step "Let's setup your user account..."
@@ -812,9 +848,6 @@ install_mode_form() {
   if [[ -d /sys/firmware/efi ]] && ! $full_disk_only; then
     choices+=("Free space install (alongside existing data)")
   fi
-  # OEM: install the whole system now, defer user setup to the machine's
-  # first boot — for machines built to be sold or handed on.
-  choices+=("OEM install (new owner creates their user on first boot)")
   choices+=("Choose a different disk")
 
   step "Let's select how to install Omarchy..."
@@ -860,8 +893,10 @@ confirm_disk_overwrite() {
 }
 
 # Decide what and how to install: sets install_target (full_disk|free_space),
-# oem_install, and encrypt_installation. Nothing is written to disk yet — the
-# user step (skipped for OEM) runs between this and the execution below.
+# install_target and encrypt_installation. Nothing is written to disk yet —
+# the user step runs between this and the execution below. (OEM mode never
+# reaches here; it's armed by Ctrl+C on the first screen and goes straight to
+# disk selection.)
 select_installation() {
   local full_disk_only
 
@@ -876,22 +911,12 @@ select_installation() {
 
     case "$install_mode" in
       "Full disk install")
-        oem_install=false
         if confirm_disk_overwrite; then
           install_target="full_disk"
           return 0
         fi
-        ;;
-      "OEM install"*)
-        oem_install=true
-        if confirm_disk_overwrite; then
-          install_target="full_disk"
-          return 0
-        fi
-        oem_install=false
         ;;
       "Free space install"*)
-        oem_install=false
         if run_partition_decide; then
           install_target="free_space"
           return 0
@@ -904,20 +929,18 @@ select_installation() {
   done
 }
 
-# STEP 3: WHERE AND HOW TO INSTALL
+# STEP 1: KEYBOARD (Ctrl+C here arms OEM mode and jumps to disk selection)
 
 oem_install=false
 install_target="full_disk"
 
-disk_form
-select_installation
-
-# STEP 3: KEYBOARD + USER (OEM defers both to the machine's first boot)
+keyboard_form true
 
 if $oem_install; then
-  # A defined default keymap so the system boots before first-boot setup; the
-  # owner picks their real layout in the OOBE, which re-keys the console and,
-  # on encrypted installs, rebuilds the initramfs so the LUKS prompt matches.
+  # OEM: no user setup, and the keyboard is deferred to the machine's first
+  # boot. A defined default keymap so it boots before then; the owner picks
+  # their real layout in the OOBE, which re-keys the console and, on encrypted
+  # installs, rebuilds the initramfs so the LUKS prompt matches.
   keyboard="us"
   username=""
   password=""
@@ -926,10 +949,20 @@ if $oem_install; then
   email_address=""
   hostname="omarchy"
   timezone="UTC"
+
+  # Jump straight to disk selection + overwrite confirmation (encrypted by
+  # default, Ctrl+C toggles unencrypted). OEM is always a full-disk install.
+  disk_form
+  until confirm_disk_overwrite; do
+    disk_form
+  done
+  install_target="full_disk"
 else
-  # Keyboard before the user step so the LUKS passphrase is typed under the
-  # chosen layout (typing it under the wrong one locks the user out at boot).
-  keyboard_form
+  # Normal install: pick the disk, then the install mode, then the user. The
+  # keyboard chosen above is already loaded, so the LUKS passphrase entered in
+  # the user step is typed under the right layout.
+  disk_form
+  select_installation
   user_step
 fi
 
