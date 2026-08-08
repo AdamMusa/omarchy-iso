@@ -695,9 +695,14 @@ drive_oem_setup() {
   log "Driving the OEM first-boot setup"
 
   # OEM defers the keyboard step to first boot; it comes before the user form.
+  # Pick English (UK) (one row above the preselected English (US)) so the
+  # verifier can prove the deferred step applied a non-default layout — UK
+  # leaves every letter identical to US, so the typed password (sent as raw
+  # keycodes) still matches the literal one the harness pipes to sudo.
   wait_for_screen "keyboard layout" 600
-  capture_console "success-oem-01-keyboard-layout"
-  press ret # English (US) preselected
+  press up
+  capture_console "success-oem-01-keyboard-layout-uk"
+  press ret
 
   wait_for_screen "Username" 120
   capture_console "success-oem-02-username"
@@ -718,7 +723,12 @@ drive_oem_setup() {
   press ret
 
   wait_for_screen "Email address" 60
-  type_text "test@omarchy.org"
+  # The keyboard step above applied English (UK), where '@' is Shift+' (not
+  # Shift+2 as on US); send that keycode so the typed email is correct under
+  # the new layout — itself further proof the deferred keymap took effect.
+  type_text "test"
+  press shift-apostrophe
+  type_text "omarchy.org"
   capture_console "success-oem-04-email"
   press ret
 
@@ -847,7 +857,7 @@ EOF
   press ret
   sleep 3
 
-  type_text "curl -fsS http://10.0.2.2:$HTTP_PORT/bootstrap | bash"
+  type_text "curl -fsS http://10.0.2.2:$HTTP_PORT/bootstrap -o /tmp/bs && bash /tmp/bs"
   capture_console "success-first-boot-05-bootstrap-command"
   press ret
 
