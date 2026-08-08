@@ -781,25 +781,6 @@ open_partition_tool() {
   sleep 1
 }
 
-# OEM mode needs the bundled runtime package to ship the first-boot setup
-# (omarchy-oem-setup); an ISO built against an older runtime must not offer a
-# mode whose install would fail at the staging phase. Peek into the offline
-# mirror's runtime package once; outside the ISO (dry runs) offer the mode.
-oem_supported() {
-  if [[ -z ${OEM_SUPPORTED:-} ]]; then
-    local mirror=/var/cache/omarchy/mirror/offline pkg
-    OEM_SUPPORTED=true
-    if [[ -d $mirror ]]; then
-      pkg=$(ls "$mirror/$OMARCHY_RUNTIME_PACKAGE"-[0-9]*.pkg.tar.zst 2>/dev/null | head -1)
-      if [[ -z $pkg ]] || ! tar -tf "$pkg" usr/bin/omarchy-oem-setup \
-        usr/share/omarchy/install/oem/omarchy-oem-setup.service &>/dev/null; then
-        OEM_SUPPORTED=false
-      fi
-    fi
-  fi
-  [[ $OEM_SUPPORTED == true ]]
-}
-
 # If the disk has no partition table or no unallocated free space, the only
 # viable paths write the whole disk, so the free-space mode is not offered.
 requires_full_disk_install() {
@@ -833,9 +814,7 @@ install_mode_form() {
   fi
   # OEM: install the whole system now, defer user setup to the machine's
   # first boot — for machines built to be sold or handed on.
-  if oem_supported; then
-    choices+=("OEM install (new owner creates their user on first boot)")
-  fi
+  choices+=("OEM install (new owner creates their user on first boot)")
   choices+=("Choose a different disk")
 
   step "Let's select how to install Omarchy..."
@@ -893,13 +872,7 @@ select_installation() {
       full_disk_only=false
     fi
 
-    # A blank disk with no OEM choice to offer has exactly one viable mode;
-    # skip the picker like the pre-OEM flow did.
-    if $full_disk_only && ! oem_supported; then
-      install_mode="Full disk install"
-    else
-      install_mode_form
-    fi
+    install_mode_form
 
     case "$install_mode" in
       "Full disk install")
@@ -907,11 +880,6 @@ select_installation() {
         if confirm_disk_overwrite; then
           install_target="full_disk"
           return 0
-        fi
-        # When the picker was skipped there is no menu to fall back to;
-        # declining the overwrite means picking another disk, as before.
-        if $full_disk_only && ! oem_supported; then
-          disk_form
         fi
         ;;
       "OEM install"*)
