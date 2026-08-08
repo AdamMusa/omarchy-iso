@@ -73,17 +73,18 @@ notice() {
 # STEP 1: KEYBOARD LAYOUT
 
 keyboard_form() {
-  step "Let's setup your machine..."
-
-  # On the first screen, Ctrl+C is the hidden entry into OEM mode — the same
-  # idiom the disk-overwrite screen uses for unencrypted. $1 is "true" only for
-  # that first invocation; the review-loop re-edit passes nothing so a stray
-  # Ctrl+C there can't flip an in-progress user install into OEM.
+  # The Ctrl+C hint sits directly under the header (no blank line between),
+  # matching the disk-overwrite screen's unencrypted offer. Ctrl+C on the first
+  # screen is the hidden entry into OEM mode; $1 is "true" only for that first
+  # invocation, so the review-loop re-edit can't flip a user install into OEM.
   local allow_oem="${1:-false}"
+  clear_logo
+  echo
+  say "Let's setup your machine..."
   if $allow_oem; then
     say --foreground 8 "Press Ctrl+C to prepare this machine for another owner."
-    echo
   fi
+  echo
 
   keyboards=$'Azerbaijani|azerty
 Belarusian|by
