@@ -38,10 +38,109 @@ measure_terminal() {
 }
 measure_terminal
 
+# The live VT resizes late during boot: tty1 starts as the 80-column boot
+# console and only grows once the kernel framebuffer/KMS takes over (noticeably
+# late in VMs). The logo is wider than 80 columns, so a first draw against that
+# transient narrow console wraps the logo ("smushed") and can't center it
+# (padding clamps to 0, so it hugs the left). A terminal emulator (or sudo's
+# pty) has the same problem the other way: it reports a stale 24x80 for a few
+# hundred ms after start before its real winsize is set. Either way, hold the
+# first draw until the width settles at (or above) the logo width. A real VT
+# that never widens (e.g. nomodeset) still proceeds after the cap.
+wait_for_stable_terminal() {
+  local width last="" stable=0 waited=0
+  while (( waited < 5000 )); do
+    width=$(stty size 2>/dev/null </dev/tty | awk '{print $2}')
+    [[ $width =~ ^[0-9]+$ ]] || width=0
+    if [[ $width == "$last" ]] && (( width >= LOGO_WIDTH )); then
+      (( ++stable >= 3 )) && break
+    else
+      stable=0
+    fi
+    last=$width
+    sleep 0.2
+    (( waited += 200 ))
+  done
+}
+
 clear_logo() {
   measure_terminal
   printf "\033[H\033[2J"
   gum style --foreground 2 --padding "1 0 0 $PADDING_LEFT" "$(<"$LOGO_PATH")"
+}
+
+# Vertically-centered welcome shown once before the keyboard step — the same
+# frame the deferred-provisioning first boot opens on, so install and first boot
+# bookend the setup identically. Logo, the Omarchy tagline, and a single button,
+# centered like the boot logo. No animation.
+greeter() {
+  measure_terminal
+
+  local rows logo_h content_h top cols logo_row tagline_row hint_row
+  local tagline hint tpad hpad anim
+  cols=$TERM_WIDTH
+  rows=$(stty size 2>/dev/null </dev/tty | awk '{print $1}')
+  [[ $rows =~ ^[0-9]+$ ]] || rows=${LINES:-24}
+  logo_h=$(wc -l <"$LOGO_PATH")
+
+  # logo + blank + tagline + blank + hint
+  content_h=$((logo_h + 4))
+  top=$(((rows - content_h) / 2))
+  (( top < 0 )) && top=0
+  logo_row=$((top + 1))
+  tagline_row=$((top + logo_h + 2))
+  hint_row=$((top + logo_h + 4))
+
+  printf '\033[?25l\033[H\033[2J'
+
+  printf '\033[%d;1H' "$logo_row"
+  gum style --foreground 2 --padding "0 0 0 $PADDING_LEFT" "$(<"$LOGO_PATH")"
+
+  tagline="Beautiful, Modern & Opinionated Linux by DHH"
+  tpad=$(((cols - ${#tagline}) / 2)); (( tpad < 0 )) && tpad=0
+  printf '\033[%d;%dH%s' "$tagline_row" "$((tpad + 1))" "$tagline"
+
+  hint="Press Return to Start Install"
+  hpad=$(((cols - ${#hint}) / 2)); (( hpad < 0 )) && hpad=0
+  printf '\033[%d;%dH\033[2m%s\033[0m' "$hint_row" "$((hpad + 1))" "$hint"
+
+  # ColorShift the logo: a green base (indexed color 2) with a cyan accent (6)
+  # drifting through, settling on green. Indexed ANSI colors, not hex — the
+  # framebuffer console can't render tte's truecolor faithfully (it crushes the
+  # palette to a muddy lavender), but the 16 indexed colors map to the Tokyo
+  # Night palette and render true. One long-running invocation (many cycles) so
+  # it never restarts — a restart is what flashed. The effect reads from
+  # /dev/null so it never swallows the Return; --reuse-canvas paints upward from
+  # the saved cursor, anchored one row below the logo.
+  if command -v tte >/dev/null 2>&1; then
+    printf '\033[%d;1H\0337' "$((logo_row + logo_h))"
+    # Run tte directly (not inside a `while` subshell) so $anim is tte's own
+    # PID: killing a wrapping subshell would orphan tte, which then keeps
+    # painting the logo over the keyboard step. --cycles is high enough that it
+    # never ends on its own before Return.
+    tte -i "$LOGO_PATH" \
+      --canvas-width "$cols" \
+      --anchor-text c \
+      --frame-rate 60 \
+      --reuse-canvas \
+      colorshift \
+      --gradient-stops 2 10 6 10 \
+      --gradient-frames 3 \
+      --cycles 1000 \
+      --final-gradient-stops 2 \
+      </dev/null >/dev/tty 2>/dev/null &
+    anim=$!
+  fi
+
+  IFS= read -r _ </dev/tty || true
+  # Tolerate tte's kill signal in `wait` so a future `set -e` here can't abort.
+  [[ -n ${anim:-} ]] && { kill "$anim" 2>/dev/null; wait "$anim" 2>/dev/null || true; }
+  # tte leaves the tty in raw/no-echo mode when killed; restore it or the gum
+  # prompts in the keyboard step that follows silently die.
+  stty sane </dev/tty 2>/dev/null || true
+  # Reset the screen so the leftover animation frame doesn't linger under the
+  # keyboard step that follows.
+  printf '\033[0m\033[H\033[2J\033[?25h'
 }
 
 abort() {
@@ -73,11 +172,22 @@ notice() {
 # STEP 1: KEYBOARD LAYOUT
 
 keyboard_form() {
-  step "Let's setup your machine..."
+  # The Ctrl+C hint sits directly under the header (no blank line between),
+  # matching the disk-overwrite screen's unencrypted offer. Ctrl+C on the first
+  # screen is the hidden entry into deferred provisioning; $1 is "true" only for that first
+  # invocation, so the review-loop re-edit can't flip a user install into it.
+  local allow_defer_provisioning="${1:-false}"
+  clear_logo
+  echo
+  say "Let's setup your machine..."
+  if $allow_defer_provisioning; then
+    say --foreground 8 "Press Ctrl+C to prepare this machine for another owner."
+  fi
+  echo
+
   keyboards=$'Azerbaijani|azerty
 Belarusian|by
 Belgian|be-latin1
-Bosnian|ba
 Bulgarian|bg-cp1251
 Croatian|croat
 Czech|cz
@@ -103,7 +213,6 @@ Irish|ie
 Italian|it
 Japanese|jp106
 Kazakh|kazakh
-Khmer (Cambodia)|khmer
 Kyrgyz|kyrgyz
 Lao|la-latin1
 Latvian|lv
@@ -124,7 +233,19 @@ Swedish|sv-latin1
 Tajik|tj_alt-UTF8
 Turkish|trq
 Ukrainian|ua'
-  choice=$(printf '%s\n' "$keyboards" | cut -d'|' -f1 | gum choose --height 10 --selected "English (US)" --header "Select keyboard layout") || abort
+  choice=$(printf '%s\n' "$keyboards" | cut -d'|' -f1 | gum choose --height 10 --selected "English (US)" --header "Select keyboard layout")
+  local status=$?
+
+  if $allow_defer_provisioning && (( status == 130 )); then
+    if confirm_prepare_for_another_owner; then
+      defer_provisioning=true
+      return 0
+    fi
+    keyboard_form true # declined: back to the keyboard picker
+    return
+  fi
+  (( status == 0 )) || abort
+
   keyboard=$(printf '%s\n' "$keyboards" | awk -F'|' -v c="$choice" '$1==c{print $2; exit}')
 
   # Only attempt to load keyboard layout if we're on a real console
@@ -134,9 +255,22 @@ Ukrainian|ua'
   fi
 }
 
-keyboard_form
+# Ctrl+C on the first screen offers to prepare the machine for another owner.
+# Confirm it before committing, so an accidental Ctrl+C doesn't silently switch
+# the whole install.
+confirm_prepare_for_another_owner() {
+  clear_logo
+  echo
+  say "This prepares the machine for another owner."
+  say --foreground 8 "The system installs now, but setup is delayed until first boot."
+  echo
+  gum confirm --affirmative "Yes, prepare for another owner" --negative "No, keep setting up" \
+    "Prepare this machine for another owner?"
+}
 
-# STEP 2: USER
+# The user step. Deferred-provisioning installs skip it entirely — the machine's first owner
+# picks their keyboard and creates their user in the first-boot setup, so the
+# operator sets nothing user-specific.
 
 user_form() {
   step "Let's setup your user account..."
@@ -197,11 +331,12 @@ user_form() {
   fi
 }
 
-user_form
+user_step() {
+  user_form
 
-while true; do
-  # Add manual padding since gum table -p doesn't respect padding
-  echo -e "Field,Value
+  while true; do
+    # Add manual padding since gum table -p doesn't respect padding
+    echo -e "Field,Value
 Username,$username
 Password,$(printf "%${#password}s" | tr ' ' '*')
 Full name,${full_name:-[Skipped]}
@@ -209,16 +344,17 @@ Email address,${email_address:-[Skipped]}
 Hostname,$hostname
 Timezone,$timezone
 Keyboard,$keyboard" |
-    gum table -s "," -p | sed "s/^/${PADDING_LEFT_SPACES}/"
+      gum table -s "," -p | sed "s/^/${PADDING_LEFT_SPACES}/"
 
-  echo
-  if gum confirm --negative "No, change it" "Does this look right?"; then
-    break
-  else
-    keyboard_form
-    user_form
-  fi
-done
+    echo
+    if gum confirm --negative "No, change it" "Does this look right?"; then
+      break
+    else
+      keyboard_form
+      user_form
+    fi
+  done
+}
 
 # STEP 3: DISK
 
@@ -347,10 +483,21 @@ wait_for_device() {
 
 # Save the configurator answers the installer consumes: git identity and
 # encryption choice as plain files, account details as archinstall credentials.
+# Deferred-provisioning installs defer the user to first boot: no credentials, and on encrypted
+# targets the orchestrator generates a throwaway LUKS passphrase itself.
 write_user_files() {
   echo "$full_name" >user_full_name.txt
   echo "$email_address" >user_email_address.txt
   printf '%s\n' "$encrypt_installation" >user_encrypt_installation.txt
+
+  if $defer_provisioning; then
+    cat <<-_EOF_ >user_credentials.json
+{
+    "users": []
+}
+_EOF_
+    return
+  fi
 
   local password_escaped password_hash_escaped username_escaped
   password_escaped=$(echo -n "$password" | jq -Rsa)
@@ -413,10 +560,10 @@ not_enough_space() {
   return 1
 }
 
-run_partition_install() {
-  local dry=false
-  [[ "${1:-}" == "dry" ]] && dry=true
-
+# Decide half of the free-space install: checks, free-space analysis, and the
+# encryption confirm. Sets the globals run_partition_execute needs. Returns 1
+# to fall back to the install-mode picker.
+run_partition_decide() {
   step "Checking for BitLocker on $disk"
   local bl_part
   bl_part=$(detect_bitlocker || true)
@@ -448,7 +595,8 @@ run_partition_install() {
 
   # An unlabeled disk has no partition table for parted to scan, so we
   # synthesize a whole-disk free region and mklabel gpt before mkpart.
-  local FREE_SPACE_INFO needs_mklabel=false pt_type disk_size_b
+  local FREE_SPACE_INFO pt_type disk_size_b
+  needs_mklabel=false
   pt_type=$(lsblk -dno PTTYPE "$disk" 2>/dev/null)
   if [[ -z "$pt_type" ]]; then
     disk_size_b=$(lsblk -bdno SIZE "$disk" 2>/dev/null)
@@ -491,7 +639,6 @@ run_partition_install() {
   local EFI_SIZE_B=$((2 * gib))
   local MIN_INSTALL_B=$((32 * gib))    # Minimum total Omarchy allocation
 
-  local EFI_START_B EFI_END_B ROOT_START_B ROOT_END_B
   EFI_START_B=$(( (FREE_START_B + ALIGN - 1) / ALIGN * ALIGN ))
   EFI_END_B=$((EFI_START_B + EFI_SIZE_B))
   ROOT_START_B=$(( (EFI_END_B + 1 + ALIGN - 1) / ALIGN * ALIGN ))
@@ -554,7 +701,6 @@ run_partition_install() {
     esac
   done
 
-  local esp_mount_in_target
   if [[ "$encrypt_installation" == "true" ]]; then
     esp_mount_in_target=/boot
   else
@@ -563,12 +709,11 @@ run_partition_install() {
 
   kernel_choice=$(detect_kernel)
 
-  local last_part efi_part_num root_part_num
+  local last_part
   last_part=$(lsblk -n -o PARTN "$disk" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -1)
   efi_part_num=$(( ${last_part:-0} + 1 ))
   root_part_num=$(( efi_part_num + 1 ))
 
-  local efi_dev root_partition_device root_mapper
   efi_dev=$(partition_path "$disk" "$efi_part_num")
   root_partition_device=$(partition_path "$disk" "$root_part_num")
   if [[ "$encrypt_installation" == "true" ]]; then
@@ -576,6 +721,14 @@ run_partition_install() {
   else
     root_mapper="$root_partition_device"
   fi
+}
+
+# Execute half of the free-space install: partition, format, mount, and write
+# the pre-mounted (protected) install configuration. Runs after the user step
+# so LUKS can be formatted with the user's password.
+run_partition_execute() {
+  local dry=false
+  [[ "${1:-}" == "dry" ]] && dry=true
 
   if $dry; then
     $needs_mklabel && say "[dry] would initialize GPT on $disk"
@@ -633,10 +786,6 @@ run_partition_install() {
     mkfs.fat -F32 -n OMARCHY_EFI "$efi_dev"
     mount "$efi_dev" /mnt"$esp_mount_in_target"
   fi
-
-  clear
-
-  write_user_files
 
   local luks_uuid_json="null" luks_uuid
   if [[ "$encrypt_installation" == "true" ]]; then
@@ -716,10 +865,6 @@ run_partition_install() {
     "version": "3.0.9"
 }
 _EOF_
-
-  if $dry; then
-    print_dry_run_files
-  fi
 }
 
 disk_form() {
@@ -771,8 +916,7 @@ open_partition_tool() {
 }
 
 # If the disk has no partition table or no unallocated free space, the only
-# viable path is a full-disk install. Skip the install-mode picker and go
-# straight to confirmation.
+# viable paths write the whole disk, so the free-space mode is not offered.
 requires_full_disk_install() {
   local pt_type free_space_b
   pt_type=$(lsblk -dno PTTYPE "$disk" 2>/dev/null)
@@ -799,7 +943,7 @@ install_mode_form() {
 
   # The free-space/protected path registers an EFI boot entry and is UEFI-only.
   # Full-disk installs still support BIOS through the orchestrator's BIOS branch.
-  if [[ -d /sys/firmware/efi ]]; then
+  if [[ -d /sys/firmware/efi ]] && ! $full_disk_only; then
     choices+=("Free space install (alongside existing data)")
   fi
   choices+=("Choose a different disk")
@@ -846,30 +990,43 @@ confirm_disk_overwrite() {
   done
 }
 
+# Decide what and how to install: sets install_target (full_disk|free_space),
+# install_target and encrypt_installation. Nothing is written to disk yet —
+# the user step runs between this and the execution below. (deferred provisioning never
+# reaches here; it's armed by Ctrl+C on the first screen and goes straight to
+# disk selection.)
 select_installation() {
   local full_disk_only
 
   while true; do
     if requires_full_disk_install; then
       full_disk_only=true
-      install_mode="Full disk install"
     else
       full_disk_only=false
+    fi
+
+    # With no free-space option to offer, a full-disk install is the only
+    # mode, so skip the picker and go straight to the overwrite confirm.
+    if $full_disk_only; then
+      install_mode="Full disk install"
+    else
       install_mode_form
     fi
 
     case "$install_mode" in
       "Full disk install")
         if confirm_disk_overwrite; then
+          install_target="full_disk"
           return 0
         fi
-        if $full_disk_only; then
-          disk_form
-        fi
+        # When the picker was skipped, declining the overwrite means the user
+        # wants a different disk.
+        $full_disk_only && disk_form
         ;;
-      "Free space install (alongside existing data)")
-        if run_partition_install "$@"; then
-          exit 0
+      "Free space install"*)
+        if run_partition_decide; then
+          install_target="free_space"
+          return 0
         fi
         ;;
       "Choose a different disk")
@@ -879,12 +1036,63 @@ select_installation() {
   done
 }
 
-disk_form
-select_installation "$@"
+# STEP 1: KEYBOARD (Ctrl+C here arms deferred provisioning and jumps to disk selection)
+
+defer_provisioning=false
+install_target="full_disk"
+
+# Let the live VT reach its settled width before the first screen so the logo
+# isn't measured against the transient 80-column boot console.
+wait_for_stable_terminal
+
+greeter
+
+keyboard_form true
+
+if $defer_provisioning; then
+  # Deferred provisioning: no user setup, and the keyboard is deferred to the machine's first
+  # boot. A defined default keymap so it boots before then; the owner picks
+  # their real layout in the OOBE, which re-keys the console and, on encrypted
+  # installs, rebuilds the initramfs so the LUKS prompt matches.
+  keyboard="us"
+  username=""
+  password=""
+  password_hash=""
+  full_name=""
+  email_address=""
+  # Neutral defaults for the install; the owner overwrites both in the
+  # first-boot OOBE (omarchy-provision-owner).
+  hostname="omarchy"
+  timezone="UTC"
+
+  # Jump straight to disk selection + overwrite confirmation (encrypted by
+  # default, Ctrl+C toggles unencrypted). deferred provisioning is always a full-disk install.
+  disk_form
+  until confirm_disk_overwrite; do
+    disk_form
+  done
+  install_target="full_disk"
+else
+  # Normal install: keyboard (done above) → user → disk → install mode. The
+  # keyboard chosen above is already loaded, so the LUKS passphrase entered in
+  # the user step is typed under the right layout.
+  user_step
+  disk_form
+  select_installation
+fi
 
 clear
 
 write_user_files
+
+if [[ $install_target == "free_space" ]]; then
+  run_partition_execute "$@"
+
+  if [[ ${1:-} == "dry" ]]; then
+    print_dry_run_files
+  fi
+  exit 0
+fi
 
 # Setup partition layout
 disk_size=$(lsblk -bdno SIZE "$disk")
@@ -902,14 +1110,21 @@ main_partition_size=$((disk_size_in_mib - main_partition_start - gpt_backup_rese
 kernel_choice=$(detect_kernel)
 
 if [[ $encrypt_installation == true ]]; then
+  # Deferred-provisioning installs carry no password: the orchestrator generates a throwaway
+  # LUKS passphrase and stages it for the first-boot re-key.
+  if $defer_provisioning; then
+    encryption_password_line=""
+  else
+    encryption_password_line=",
+            \"encryption_password\": $(echo -n "$password" | jq -Rsa)"
+  fi
   disk_encryption_config=$(cat <<-_EOF_
 ,
         "disk_encryption": {
             "encryption_type": "luks",
             "lvm_volumes": [],
             "iter_time": 2000,
-            "partitions": [ "8c2c2b92-1070-455d-b76a-56263bab24aa" ],
-            "encryption_password": $(echo -n "$password" | jq -Rsa)
+            "partitions": [ "8c2c2b92-1070-455d-b76a-56263bab24aa" ]$encryption_password_line
         }
 _EOF_
 )
@@ -927,6 +1142,7 @@ cat <<-_EOF_ >user_configuration.json
     "custom_commands": [],
     "omarchy_install": {
         "mode": "full_disk",
+        "defer_provisioning": $defer_provisioning,
         "target_mount": "/mnt",
         "boot": {
             "esp_mount": "/boot",

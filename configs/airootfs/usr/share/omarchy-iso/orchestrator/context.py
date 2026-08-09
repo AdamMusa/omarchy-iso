@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ class InstallContext:
     user_credentials: dict
     arch_config_path: Path
     omarchy_install: dict[str, Any]
+    defer_provisioning: bool = False
 
     target: Path = Path("/mnt")
     omarchy_path: Path = Path("/usr/share/omarchy")
@@ -48,10 +50,54 @@ class InstallContext:
         user_configuration = json.loads(config_path.read_text())
         omarchy_install = user_configuration.get("omarchy_install") or _default_omarchy_install(user_configuration)
 
+        # Deferred provisioning: the whole system installs but user creation is deferred to
+        # first boot. Selected by the configurator (omarchy_install.defer_provisioning) or by
+        # an `defer-provisioning` marker file on an autoinstall drive, which also replaces the
+        # user_credentials.json requirement.
+        defer_provisioning_marker = _optional_path(os.environ.get("OMARCHY_INSTALL_DEFER_PROVISIONING_FILE"))
+        defer_provisioning = bool(omarchy_install.get("defer_provisioning")) or defer_provisioning_marker is not None
+        omarchy_install["defer_provisioning"] = defer_provisioning
+
+        if creds_path.exists():
+            user_credentials = json.loads(creds_path.read_text())
+        elif defer_provisioning:
+            user_credentials = {"users": []}
+        else:
+            raise RuntimeError(f"credentials file missing: {creds_path}")
+
+        if defer_provisioning:
+            # Deferred provisioning promises no account until first boot. A supplied
+            # credentials file (a rig handing over its LUKS passphrase) must
+            # not smuggle in users or a root password.
+            encryption_password = user_credentials.get("encryption_password")
+            user_credentials = {"users": []}
+            if encryption_password:
+                user_credentials["encryption_password"] = encryption_password
+
         arch_configuration = dict(user_configuration)
         arch_configuration.pop("omarchy_install", None)
+
+        if defer_provisioning:
+            # The userless invariant covers the archinstall config too: a
+            # combined/legacy config could carry account authentication that
+            # archinstall would still act on (users, a root password). Strip
+            # every such field so no account is created before first boot.
+            _strip_account_fields(arch_configuration)
+
         state_dir = Path(os.environ.get("OMARCHY_INSTALL_STATE_DIR", "/run/omarchy-install"))
         state_dir.mkdir(parents=True, exist_ok=True)
+
+        if defer_provisioning:
+            # Encrypted deferred-provisioning installs have no user password to protect LUKS
+            # with. Generate a throwaway passphrase (staged for first-boot
+            # re-key by the stage_provisioning_state phase) and hand it to archinstall
+            # through both places it may look: the disk_encryption block and
+            # the credentials file.
+            _inject_provisioning_encryption_password(arch_configuration, user_credentials)
+            creds_path = state_dir / "provisioning-user_credentials.json"
+            creds_path.write_text(json.dumps(user_credentials, indent=2) + "\n")
+            creds_path.chmod(0o600)
+
         arch_config_path = state_dir / "archinstall-user_configuration.json"
         arch_config_path.write_text(json.dumps(arch_configuration, indent=2) + "\n")
 
@@ -64,9 +110,10 @@ class InstallContext:
             authorized_keys_path=_optional_path(os.environ.get("OMARCHY_INSTALL_AUTHORIZED_KEYS_FILE")),
             tailscale_authkey_path=_optional_path(os.environ.get("OMARCHY_INSTALL_TAILSCALE_AUTHKEY_FILE")),
             user_configuration=user_configuration,
-            user_credentials=json.loads(creds_path.read_text()),
+            user_credentials=user_credentials,
             arch_config_path=arch_config_path,
             omarchy_install=omarchy_install,
+            defer_provisioning=defer_provisioning,
             state_dir=state_dir,
         )
         disk_config = user_configuration.get("disk_config", {})
@@ -77,7 +124,12 @@ class InstallContext:
 
     @property
     def username(self) -> str:
-        return self.user_credentials["users"][0]["username"]
+        users = self.user_credentials.get("users") or []
+        if users:
+            return users[0]["username"]
+        if self.defer_provisioning:
+            return ""
+        raise RuntimeError("user_credentials.json contains no users")
 
     @property
     def mode(self) -> str:
@@ -89,6 +141,38 @@ class InstallContext:
     @property
     def is_protected(self) -> bool:
         return self.mode == "protected"
+
+
+def _strip_account_fields(arch_configuration: dict) -> None:
+    """Remove every field archinstall reads to create users or set a root
+    password, so it cannot ship a hidden provisioning account.
+    Encryption material lives elsewhere (disk_config.disk_encryption) and is
+    untouched."""
+    for key in ("!users", "!root-password", "root_enc_password", "users"):
+        arch_configuration.pop(key, None)
+
+    auth = arch_configuration.get("auth_config")
+    if isinstance(auth, dict):
+        for key in ("users", "root_enc_password"):
+            auth.pop(key, None)
+
+
+def _inject_provisioning_encryption_password(arch_configuration: dict, user_credentials: dict) -> None:
+    """Ensure an encrypted deferred-provisioning install has a LUKS passphrase archinstall can
+    use. Reuse one the input already carries (an autoinstall rig may supply
+    its own); otherwise generate a throwaway. Mutates the disk_encryption
+    block in place — arch_configuration shares it with user_configuration, so
+    the stage_provisioning_state phase can read the effective passphrase back."""
+    disk_encryption = (arch_configuration.get("disk_config") or {}).get("disk_encryption")
+    if disk_encryption is None:
+        return
+
+    password = disk_encryption.get("encryption_password") or user_credentials.get("encryption_password")
+    if not password:
+        password = secrets.token_urlsafe(24)
+
+    disk_encryption["encryption_password"] = password
+    user_credentials["encryption_password"] = password
 
 
 def _default_omarchy_install(user_configuration: dict) -> dict[str, Any]:

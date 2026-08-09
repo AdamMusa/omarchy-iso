@@ -11,6 +11,9 @@
 # Anything less than the pair means this isn't an autoinstall drive, and the
 # caller falls back to the wizard.
 #
+# A `defer-provisioning` marker file stands in for user_credentials.json: deferred-provisioning
+# installs defer user creation to first boot, so imaging rigs ship no credentials.
+#
 # The optional argument prefixes every path the script touches; tests use it to
 # run against a sandbox instead of the live system.
 
@@ -35,10 +38,20 @@ done
 mkdir -p "$mnt"
 mount -o ro "$device" "$mnt" || exit 1
 
+# Clear any inputs a previous load in this live session left in /root before
+# copying the current drive: a stale `defer-provisioning` marker or credentials file would
+# otherwise force a fresh drive back into deferred provisioning or hand it an old
+# LUKS passphrase. The interactive wizard writes these same names, but a
+# cidata load always precedes it, so nothing of the user's is discarded here.
+optional_inputs=(user_credentials.json defer-provisioning user_full_name.txt user_email_address.txt user_encrypt_installation.txt authorized_keys tailscale_authkey)
+for file in user_configuration.json "${optional_inputs[@]}"; do
+  rm -f "$dest/$file"
+done
+
 loaded=1
-if [[ -f $mnt/user_configuration.json && -f $mnt/user_credentials.json ]]; then
-  files=("$mnt"/user_configuration.json "$mnt"/user_credentials.json)
-  for file in user_full_name.txt user_email_address.txt user_encrypt_installation.txt authorized_keys tailscale_authkey; do
+if [[ -f $mnt/user_configuration.json ]] && [[ -f $mnt/user_credentials.json || -f $mnt/defer-provisioning ]]; then
+  files=("$mnt"/user_configuration.json)
+  for file in "${optional_inputs[@]}"; do
     [[ -f $mnt/$file ]] && files+=("$mnt/$file")
   done
   if cp "${files[@]}" "$dest"/; then

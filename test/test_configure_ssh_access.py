@@ -60,7 +60,7 @@ class ConfigureSshAccessTest(unittest.TestCase):
         if authorized_keys is not None:
             authorized_keys_path = self.target / "authorized_keys"
             authorized_keys_path.write_text(authorized_keys)
-        return types.SimpleNamespace(target=self.target, username="jeff", authorized_keys_path=authorized_keys_path)
+        return types.SimpleNamespace(target=self.target, username="jeff", authorized_keys_path=authorized_keys_path, defer_provisioning=False)
 
     def configure(self, **kwargs):
         phases_impl.configure_ssh_access(self.ctx(**kwargs))
