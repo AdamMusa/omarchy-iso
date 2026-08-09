@@ -606,6 +606,11 @@ audio-panel|meta_l-ctrl-a|omarchy-keyboard-panel|omarchy.audio'
 drive_configurator() {
   log "Driving the installer wizard"
 
+  # A greeter (animated logo + tagline) opens the installer; Return begins.
+  wait_for_screen "Opinionated" 300
+  capture_console "success-installer-00-greeter"
+  press ret
+
   # Keyboard is the first screen. Ctrl+C there is the hidden entry into deferred provisioning
   # mode; a normal install just selects the layout.
   wait_for_screen "keyboard layout" 300
@@ -710,7 +715,12 @@ drive_provision_owner() {
   # verifier can prove the deferred step applied a non-default layout — UK
   # leaves every letter identical to US, so the typed password (sent as raw
   # keycodes) still matches the literal one the harness pipes to sudo.
-  wait_for_screen "keyboard layout" 600
+  # A greeter (animated logo + tagline) opens first boot; Return begins.
+  wait_for_screen "Opinionated" 600
+  capture_console "success-provision-00-greeter"
+  press ret
+
+  wait_for_screen "keyboard layout" 120
   press up
   capture_console "success-provision-01-keyboard-layout-uk"
   press ret
@@ -743,13 +753,25 @@ drive_provision_owner() {
   capture_console "success-provision-04-email"
   press ret
 
+  # Hostname is deferred to first boot too.
+  wait_for_screen "Hostname" 60
+  type_text "$GUEST_HOSTNAME"
+  capture_console "success-provision-05-hostname"
+  press ret
+
+  # Timezone is deferred to first boot too; accept the geo-guessed default.
+  # Generous timeout: the tzupdate geo-guess over first-boot networking can lag.
+  wait_for_screen "Timezone" 180
+  capture_console "success-provision-06-timezone"
+  press ret
+
   wait_for_screen "look right" 60
-  capture_console "success-provision-05-review"
+  capture_console "success-provision-07-review"
   press ret
 
   # Finalization (offline Node unpack, LUKS re-key on encrypted installs)
   # runs before SDDM appears.
-  capture_console "success-provision-06-finalizing"
+  capture_console "success-provision-08-finalizing"
 }
 
 wait_for_install() {
@@ -763,6 +785,15 @@ wait_for_install() {
       log "Install finished. Confirming the reboot prompt."
       capture_console "success-installer-15-reboot"
       press ret
+      return 0
+    fi
+
+    # Deferred-provisioning installs skip the celebration and reboot on their own
+    # (no Reboot Now prompt); the first-boot greeter tagline appearing means the
+    # install finished and rebooted into setup.
+    if $PROVISION && grep -qi "Opinionated" <<<"$text"; then
+      log "Install finished and auto-rebooted into first-boot setup."
+      capture_console "success-installer-15-autoreboot"
       return 0
     fi
 
@@ -965,8 +996,17 @@ install_phase() {
   # flag to clear before powering off.
   if $PROVISION; then
     log "Waiting for provisioning first-boot setup to finish"
-    local waited=0
-    while ssh_guest "test -f /var/lib/omarchy/provisioning/pending" 2>/dev/null; do
+    local waited=0 rc
+    while true; do
+      # Capture rc via `|| rc=$?` so a non-zero result doesn't trip `set -e`
+      # (this command is intentionally allowed to "fail" — that's the signal).
+      rc=0
+      ssh_guest "test -f /var/lib/omarchy/provisioning/pending" 2>/dev/null || rc=$?
+      # rc 0 = flag still present; rc 255 = SSH not up yet (finalization may
+      # still be running) — keep waiting. Only a clean "file absent" (rc 1)
+      # means provisioning finished, so we don't snapshot mid-finalization on a
+      # transient SSH blip.
+      (( rc == 0 || rc == 255 )) || break
       if ((waited >= 900)); then
         capture_console "failure-provision-finalization-timeout"
         echo "Timed out waiting for provisioning first-boot setup to complete" >&2
@@ -975,7 +1015,29 @@ install_phase() {
       sleep 10
       ((waited += 10))
     done
-    capture_console "success-provision-06-setup-complete"
+
+    # The owner's hostname and timezone are set at first boot now, not baked
+    # into the install — confirm they actually landed on the running system.
+    # Hostname is deterministic (we typed it), so a mismatch is a hard failure;
+    # timezone is geo-guessed, so just report what landed.
+    local got_host="" got_tz=""
+    got_host=$(ssh_guest "cat /etc/hostname" 2>/dev/null | tr -d '\r\n') || got_host=""
+    got_tz=$(ssh_guest "timedatectl show -p Timezone --value" 2>/dev/null | tr -d '\r\n') || got_tz=""
+    if [[ $got_host != "$GUEST_HOSTNAME" ]]; then
+      capture_console "failure-provision-hostname-not-applied"
+      echo "First-boot hostname is '${got_host:-<empty>}', expected '$GUEST_HOSTNAME'" >&2
+      return 1
+    fi
+    log "hostname applied at first boot: $got_host"
+    if [[ -n $got_tz && $got_tz != "UTC" ]]; then
+      log "timezone applied at first boot: $got_tz"
+    else
+      echo "WARN: timezone is '${got_tz:-<empty>}' (expected the owner's choice, not UTC)" >&2
+    fi
+
+    # Deferred first-boot setup hands straight off to SDDM once the oneshot
+    # service exits — no celebration screen, no Start Omarchy button to confirm.
+    capture_console "success-provision-09-handoff"
   fi
 
   ssh_guest "echo $GUEST_PASSWORD | sudo -S cat /var/log/omarchy-install-timing.json 2>/dev/null" \
