@@ -252,7 +252,7 @@ user_form() {
   omarchy_prompt_username || return $?
   omarchy_prompt_password || return $?
 
-  # Hash the password using yescrypt
+  # Hash the password with SHA-512 crypt ($6$), which is what openssl passwd offers
   password_hash=$(printf '%s' "$password" | openssl passwd -6 -stdin)
 
   omarchy_prompt_identity || return $?

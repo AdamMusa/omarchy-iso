@@ -172,11 +172,16 @@ cp "${base_pkg_lists[1]}" "$build_cache_dir/airootfs/usr/share/omarchy-iso/omarc
 # disagree. A runtime predating the split ships no such file, which would leave
 # the configurator with no prompts at all.
 if [[ ! -f $setup_form ]]; then
-  echo "ERROR: $OMARCHY_RUNTIME_PACKAGE does not ship install/provisioning/setup-form.sh" >&2
+  if [[ -d /omarchy-source ]]; then
+    echo "ERROR: the --local-source checkout ships no install/provisioning/setup-form.sh" >&2
+    remedy="Update the checkout to a revision carrying the shared setup form."
+  else
+    echo "ERROR: $OMARCHY_RUNTIME_PACKAGE does not ship install/provisioning/setup-form.sh" >&2
+    remedy="Publish a runtime carrying the shared setup form, or build with --local-source against a checkout that has it."
+  fi
   echo "       The configurator sources its prompts from that file, so this ISO" >&2
   echo "       would boot into an installer with no questions to ask." >&2
-  echo "       Publish a runtime carrying the shared setup form, or build with" >&2
-  echo "       --local-source against a checkout that has it." >&2
+  echo "       $remedy" >&2
   exit 1
 fi
 cp "$setup_form" "$build_cache_dir/airootfs/usr/share/omarchy-iso/setup-form.sh"
