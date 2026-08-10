@@ -11,7 +11,7 @@ Phase ordering (full-disk and protected/pre-mounted):
                              base install, early Omarchy packages, Limine setup,
                              useradd, runtime Omarchy packages, fstab
     configure_hibernation  → root-owned swap/resume drop-ins
-    run_system_finalizer   → arch-chroot root omarchy-setup-system, including Snapper
+    run_system_finalizer   → arch-chroot root omarchy-apply-system, including Snapper
     finalize_limine_boot   → final Limine config/UKI build after hardware drop-ins
     run_chroot_finalizer   → arch-chroot -u user omarchy-provision-user
     configure_login        → sddm state + encrypted-install autologin
@@ -598,7 +598,7 @@ DEFERRED_BOOT_HOOKS = (
 # limine-entry-tool's 90-mkinitcpio-install.hook triggers on usr/lib/firmware/*,
 # usr/src/*/dkms.conf and usr/lib/modules/*/pkgbase, and anything but a
 # usr/lib/modules path makes it rebuild the initramfs and UKI for EVERY
-# installed kernel. omarchy-setup-system's hardware scripts routinely install
+# installed kernel. omarchy-apply-system's hardware scripts routinely install
 # such packages (sof-firmware on Intel audio, nvidia-open-dkms, linux-ptl on
 # Panther Lake, linux-t2 on Macs), so the phase can pay for several full UKI
 # builds. finalize_limine_boot runs limine-update right after, which pipes
@@ -1005,7 +1005,7 @@ def _debug_run(ctx: InstallContext, cmd: list[str]) -> None:
 #  1. point the target at the offline pacman.conf
 #  2. bind-mount the offline mirror + /opt/packages into /mnt for target pacman
 #     and bundled language runtimes
-#  3. arch-chroot as root → omarchy-setup-system --first-install
+#  3. arch-chroot as root → omarchy-apply-system --first-install
 #  4. arch-chroot as user → omarchy-provision-user --first-install
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1137,9 +1137,9 @@ def _run_target_setup_command(ctx: InstallContext, cmd: list[str], *, user: str 
 
 def run_system_finalizer(ctx: InstallContext) -> None:
     if ctx.defer_provisioning:
-        cmd = ["/usr/bin/omarchy-setup-system", "--defer-provisioning", "--first-install"]
+        cmd = ["/usr/bin/omarchy-apply-system", "--defer-provisioning", "--first-install"]
     else:
-        cmd = ["/usr/bin/omarchy-setup-system", "--install-user", ctx.username, "--first-install"]
+        cmd = ["/usr/bin/omarchy-apply-system", "--install-user", ctx.username, "--first-install"]
 
     _mask_mkinitcpio_pacman_hooks(ctx, ctx.target, TARGET_DEFERRED_BOOT_HOOKS)
     try:
