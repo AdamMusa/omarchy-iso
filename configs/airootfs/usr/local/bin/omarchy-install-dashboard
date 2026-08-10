@@ -142,8 +142,18 @@ LOGO_HEIGHT="$(logo_height)"
 (( LOGO_WIDTH > 0 )) || LOGO_WIDTH=81
 (( LOGO_HEIGHT > 0 )) || LOGO_HEIGHT=1
 CONTENT_WIDTH="$LOGO_WIDTH"
+# Rows the progress screen occupies: logo, blank, title, blank, bar, blank, tip.
+PROGRESS_HEIGHT=$((LOGO_HEIGHT + 6))
+TOP_ROW=1
 DYNAMIC_ROW=$((LOGO_HEIGHT + 3))
+LAST_SIZE=""
 LAST_PM=10
+# The finish screen mirrors the greeter's frame — logo, blank, one line, gap,
+# one button — so the last thing the installer shows matches the first. It runs
+# one row taller: `gum confirm` always paints prompt/blank/button and clears all
+# three, so the button cannot sit closer than two rows under a title we drew.
+FINISH_HEIGHT=$((LOGO_HEIGHT + 5))
+FINISH_TOP_ROW=2
 
 # ── Install progress ─────────────────────────────────────────────────────────
 #
@@ -389,15 +399,40 @@ current_tip() {
   printf '%s' "${tips[$(( (NOW - DASH_T0) / 8 % ${#tips[@]} ))]}"
 }
 
+# Vertically center a block of the given height, echoing the row it starts on.
+# Both screens here center the way the configurator's greeter centers its
+# welcome, so the install opens, runs, and closes on the same composition
+# rather than stacking each frame from row one.
+centered_top_row() {
+  local height="$1" rows top
+  rows="$(term_size)"
+  rows="${rows%% *}"
+  [[ $rows =~ ^[0-9]+$ ]] || rows=24
+  top=$(( (rows - height) / 2 ))
+  (( top < 0 )) && top=0
+  printf '%d' "$(( top + 1 ))"
+}
+
+measure_progress_layout() {
+  LAST_SIZE="$(term_size)"
+  TOP_ROW="$(centered_top_row "$PROGRESS_HEIGHT")"
+  DYNAMIC_ROW=$(( TOP_ROW + LOGO_HEIGHT + 1 ))
+}
+
 render_static() {
-  printf '%s' "$CLEAR"
-  blank_line
+  measure_progress_layout
+  printf '%s%s%d;1H' "$CLEAR" "$CSI" "$TOP_ROW"
   render_logo
   blank_line
 }
 
 render_dynamic() {
   local pm
+  # The console can still resize under us (the framebuffer settles late in VMs).
+  # Horizontal padding is recomputed every frame anyway, but the logo is drawn
+  # once, so redraw the static half at the new center rather than leave the
+  # centered layout stranded against a stale geometry.
+  [[ "$(term_size)" == "$LAST_SIZE" ]] || render_static
   set_now
   install_progress
   pm=$PROGRESS_PM
@@ -452,30 +487,40 @@ render_finish() {
   local duration effect_canvas_width
   duration="$(install_duration || true)"
   duration="${duration:-Complete}"
+  # ttfx centers its text two columns right of plain centering, so hand it a
+  # canvas two columns narrower and the animated logo lands exactly on the
+  # static one left_padding already drew. Otherwise the logo jumps a column
+  # sideways when the effect starts and again when it ends.
   effect_canvas_width="$(term_cols)"
-  (( effect_canvas_width > 1 )) && effect_canvas_width=$((effect_canvas_width - 1))
+  (( effect_canvas_width > 2 )) && effect_canvas_width=$((effect_canvas_width - 2))
+
+  # Set before anything that can fail, so reboot_prompt still lands on the
+  # button row even if the logo or the effect below never renders.
+  FINISH_TOP_ROW="$(centered_top_row "$FINISH_HEIGHT")"
 
   {
-    printf '%s%s' "$SHOW_CURSOR" "$CLEAR"
-    blank_line
+    printf '%s%s%s%d;1H' "$SHOW_CURSOR" "$CLEAR" "$CSI" "$FINISH_TOP_ROW"
     render_logo
     blank_line
     center "Installed Omarchy in ${duration}" "$CONTENT_WIDTH"
     blank_line
   } >"$TTY_PATH"
 
-  if command -v tte >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1 && [[ -f $LOGO_PATH ]]; then
-    # TTE reuse mode restores a saved cursor before moving up over its input.
-    # Save this anchor so the effect redraws the same logo rows shown above.
-    printf '%s%d;1H\0337' "$CSI" "$((LOGO_HEIGHT + 2))" >"$TTY_PATH"
-    timeout 8s tte -i "$LOGO_PATH" \
+  if [[ -f $LOGO_PATH ]]; then
+    # Reuse mode restores a saved cursor before moving up over its input. Save
+    # this anchor so the effect redraws the same logo rows shown above.
+    printf '%s%d;1H\0337' "$CSI" "$((FINISH_TOP_ROW + LOGO_HEIGHT))" >"$TTY_PATH"
+    # Smoke runs ~4s at 60fps, so the 8s cap is a stuck-process guard rather than
+    # a trim. The rate is the effect's pacing: the 260 this carried for laseretch
+    # finishes smoke in under a second, which reads as a flicker, not a send-off.
+    timeout 8s ttfx -i "$LOGO_PATH" \
       --canvas-width "$effect_canvas_width" \
       --anchor-text c \
-      --frame-rate 260 \
+      --frame-rate 60 \
       --reuse-canvas \
-      laseretch \
+      smoke \
       >"$TTY_PATH" 2>/dev/null || true
-    printf '%s%d;1H' "$CSI" "$((LOGO_HEIGHT + 8))" >"$TTY_PATH"
+    printf '%s%d;1H' "$CSI" "$((FINISH_TOP_ROW + LOGO_HEIGHT + 5))" >"$TTY_PATH"
   fi
 }
 
@@ -486,8 +531,10 @@ reboot_prompt() {
   # applies, so setting both stops on the finish screen without a keyboard.
   interactive || return 0
 
-  # Position the cursor one blank line below the title so the button sits right there.
-  printf '%s%d;1H%s' "$CSI" "$((LOGO_HEIGHT + 5))" "$CLEAR_LINE" >"$TTY_PATH"
+  # gum paints its prompt row at the cursor and the button two rows under it, so
+  # anchor on the row right below the title to put the button as close to it as
+  # gum allows. FINISH_HEIGHT budgets for the same three rows.
+  printf '%s%d;1H%s' "$CSI" "$((FINISH_TOP_ROW + LOGO_HEIGHT + 2))" "$CLEAR_LINE" >"$TTY_PATH"
 
   prompt_pad=$(( ( $(term_cols) - 18 ) / 2 ))
   (( prompt_pad < 0 )) && prompt_pad=0
