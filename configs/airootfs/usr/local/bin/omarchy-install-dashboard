@@ -519,16 +519,21 @@ render_finish() {
     # Reuse mode restores a saved cursor before moving up over its input. Save
     # this anchor so the effect redraws the same logo rows shown above.
     printf '%s%d;1H\0337' "$CSI" "$((FINISH_TOP_ROW + LOGO_HEIGHT))" >"$TTY_PATH"
-    # Smoke runs ~4s at 60fps, so the 8s cap is a stuck-process guard rather than
-    # a trim. The rate is the effect's pacing: the 260 this carried for laseretch
-    # finishes smoke in under a second, which reads as a flicker, not a send-off.
+    # Laseretch runs ~4s at 260fps, so the 8s cap is a stuck-process guard rather
+    # than a trim. --xterm-colors keeps the whole effect in the 256-index palette
+    # the way the greeter does, since the console reduces indexed codes well and
+    # truecolor ones badly, and it settles on indexed 2 — the green gum already
+    # drew the logo in above, so the send-off ends on the frame it started from
+    # instead of recoloring it. The laser and sparks keep their own hot palette.
     timeout 8s ttfx -i "$LOGO_PATH" \
       --canvas-width "$effect_canvas_width" \
       --anchor-text c \
-      --frame-rate 60 \
+      --frame-rate 260 \
       --reuse-canvas \
-      smoke \
-      >"$TTY_PATH" 2>/dev/null || true
+      --xterm-colors \
+      laseretch \
+      --final-gradient-stops 2 \
+      >"$TTY_PATH" 2>/dev/null || dashboard_log "logo effect skipped (ttfx exited $?)"
     printf '%s%d;1H' "$CSI" "$((FINISH_TOP_ROW + LOGO_HEIGHT + 5))" >"$TTY_PATH"
   fi
 }
