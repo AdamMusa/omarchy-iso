@@ -193,12 +193,8 @@ notice() {
 # STEP 1: KEYBOARD LAYOUT
 
 keyboard_form() {
-  # The Ctrl+C hint sits directly under the header (no blank line between),
-  # matching the disk-overwrite screen's unencrypted offer. Ctrl+C here is the
-  # hidden entry into deferred provisioning, and the offer stands on every visit
-  # to this screen: the user step unwinds back here on Esc and on "No, change
-  # it", and nothing is on disk yet either way, so backing up out of a user
-  # install must not strand the operator without the deferred option. Callers
+  # Ctrl+C is the hidden entry into deferred provisioning, offered on every
+  # visit: the user step unwinds back here and nothing is on disk yet. Callers
   # re-check defer_provisioning after this returns.
   local status
 
@@ -266,9 +262,8 @@ user_form() {
   omarchy_prompt_timezone || return $?
 }
 
-# Returns 0 once the account details are confirmed, or as soon as the keyboard
-# screen this unwinds to arms deferred provisioning — the caller checks
-# defer_provisioning to tell the two apart.
+# Returns 0 on confirmed account details, or as soon as the keyboard screen
+# arms deferred provisioning.
 user_step() {
   local status
 
@@ -999,11 +994,9 @@ greeter
 
 keyboard_form
 
-# Normal install: keyboard (done above) → user → disk → install mode. The
-# keyboard chosen above is already loaded, so the LUKS passphrase entered in
-# the user step is typed under the right layout. The user step can unwind back
-# to the keyboard screen (Esc, or "No, change it"), and Ctrl+C there arms
-# deferred provisioning, so it returns early and this re-checks the flag.
+# Normal install: keyboard (loaded above, so the LUKS passphrase is typed under
+# the right layout) → user → disk → install mode. The user step can unwind to
+# the keyboard screen and arm deferral there, hence the second check.
 if ! $defer_provisioning; then
   user_step
 fi
