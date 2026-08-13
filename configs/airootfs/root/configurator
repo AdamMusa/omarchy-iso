@@ -194,19 +194,19 @@ notice() {
 
 keyboard_form() {
   # The Ctrl+C hint sits directly under the header (no blank line between),
-  # matching the disk-overwrite screen's unencrypted offer. Ctrl+C on the first
-  # screen is the hidden entry into deferred provisioning; $1 is "true" only for that first
-  # invocation, so the review-loop re-edit can't flip a user install into it.
-  local allow_defer_provisioning="${1:-false}"
+  # matching the disk-overwrite screen's unencrypted offer. Ctrl+C here is the
+  # hidden entry into deferred provisioning, and the offer stands on every visit
+  # to this screen: the user step unwinds back here on Esc and on "No, change
+  # it", and nothing is on disk yet either way, so backing up out of a user
+  # install must not strand the operator without the deferred option. Callers
+  # re-check defer_provisioning after this returns.
   local status
 
   while true; do
     clear_logo
     echo
     say "Let's setup your machine..."
-    if $allow_defer_provisioning; then
-      say --foreground 8 "Press Ctrl+C to prepare this machine for another owner."
-    fi
+    say --foreground 8 "Press Ctrl+C to prepare this machine for another owner."
     echo
 
     omarchy_prompt_keyboard && status=0 || status=$?
@@ -215,7 +215,7 @@ keyboard_form() {
     # Esc means "back", and nothing precedes the first screen, so re-ask.
     ((status == OMARCHY_FORM_BACK)) && continue
 
-    if $allow_defer_provisioning && ((status == OMARCHY_FORM_SIGNAL)); then
+    if ((status == OMARCHY_FORM_SIGNAL)); then
       if confirm_prepare_for_another_owner; then
         defer_provisioning=true
         return 0
@@ -266,6 +266,9 @@ user_form() {
   omarchy_prompt_timezone || return $?
 }
 
+# Returns 0 once the account details are confirmed, or as soon as the keyboard
+# screen this unwinds to arms deferred provisioning — the caller checks
+# defer_provisioning to tell the two apart.
 user_step() {
   local status
 
@@ -277,6 +280,7 @@ user_step() {
       # keeps its long-standing behaviour of ending the install.
       ((status == OMARCHY_FORM_BACK)) || abort
       keyboard_form
+      $defer_provisioning && return 0
       continue
     fi
 
@@ -296,6 +300,7 @@ Keyboard,$keyboard" |
       break
     else
       keyboard_form
+      $defer_provisioning && return 0
     fi
   done
 }
@@ -938,7 +943,7 @@ confirm_disk_overwrite() {
 # Decide what and how to install: sets install_target (full_disk|free_space),
 # install_target and encrypt_installation. Nothing is written to disk yet —
 # the user step runs between this and the execution below. (deferred provisioning never
-# reaches here; it's armed by Ctrl+C on the first screen and goes straight to
+# reaches here; it's armed by Ctrl+C on the keyboard screen and goes straight to
 # disk selection.)
 select_installation() {
   local full_disk_only
@@ -992,7 +997,16 @@ wait_for_stable_terminal
 
 greeter
 
-keyboard_form true
+keyboard_form
+
+# Normal install: keyboard (done above) → user → disk → install mode. The
+# keyboard chosen above is already loaded, so the LUKS passphrase entered in
+# the user step is typed under the right layout. The user step can unwind back
+# to the keyboard screen (Esc, or "No, change it"), and Ctrl+C there arms
+# deferred provisioning, so it returns early and this re-checks the flag.
+if ! $defer_provisioning; then
+  user_step
+fi
 
 if $defer_provisioning; then
   # Deferred provisioning: no user setup, and the keyboard is deferred to the machine's first
@@ -1018,10 +1032,6 @@ if $defer_provisioning; then
   done
   install_target="full_disk"
 else
-  # Normal install: keyboard (done above) → user → disk → install mode. The
-  # keyboard chosen above is already loaded, so the LUKS passphrase entered in
-  # the user step is typed under the right layout.
-  user_step
   disk_form
   select_installation
 fi
