@@ -765,20 +765,26 @@ def _storage_intent(ctx: InstallContext) -> dict:
 
 def verify_protected_mounts(ctx: InstallContext) -> None:
     target = ctx.target
-    if not _is_mountpoint(target):
-        raise RuntimeError(f"protected mode: {target} is not a mountpoint")
-
     boot = _boot_intent(ctx)
     storage = _storage_intent(ctx)
+
+    # Devices before the mountpoint: when the configurator hands over paths for
+    # partitions that do not exist, "root_device /dev/nvme0n1p12 does not
+    # exist" is diagnosable from the log alone, where "/mnt is not a
+    # mountpoint" sends everyone looking at the mount instead of the paths.
     for key in ("esp_device", "root_device"):
-        if not storage.get(key):
+        device = storage.get(key)
+        if not device:
             raise RuntimeError(f"protected mode: omarchy_install.storage.{key} missing")
+        if not Path(device).exists():
+            raise RuntimeError(f"protected mode: {key} {device} does not exist")
+
+    if not _is_mountpoint(target):
+        raise RuntimeError(f"protected mode: {target} is not a mountpoint")
 
     esp_mp = target / boot["esp_mount"].lstrip("/")
     if not _is_mountpoint(esp_mp):
         esp_dev = storage["esp_device"]
-        if not Path(esp_dev).exists():
-            raise RuntimeError(f"protected mode: ESP device {esp_dev} does not exist")
         info(f"› remounting protected ESP {esp_dev} at {esp_mp}")
         esp_mp.mkdir(parents=True, exist_ok=True)
         subprocess.run(["mount", esp_dev, str(esp_mp)], check=True)

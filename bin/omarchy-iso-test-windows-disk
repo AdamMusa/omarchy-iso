@@ -5,11 +5,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
-TEST_DISK="${OMARCHY_ISO_TEST_WINDOWS_DISK:-/tmp/omarchy-iso-test-windows.qcow2}"
-TEST_OVMF_VARS="${OMARCHY_ISO_TEST_WINDOWS_OVMF_VARS:-/tmp/OVMF_VARS.omarchy-iso-test-windows.fd}"
 DISK_SIZE_GIB=96
 MIN_FREE_GIB=64
 RECREATE=0
+GAP=0
 ISO=""
 
 ACTIVE_NBD=""
@@ -19,7 +18,7 @@ TEMPORARY_DISK=""
 
 usage() {
   cat <<USAGE
-Usage: omarchy-iso-test-windows-disk [--recreate] [release/omarchy.iso]
+Usage: omarchy-iso-test-windows-disk [--recreate] [--gap] [release/omarchy.iso]
 
 Creates or validates a synthetic Windows-style test disk with:
   - a 512MiB EFI partition containing EFI/Microsoft
@@ -29,8 +28,16 @@ Creates or validates a synthetic Windows-style test disk with:
 This exercises Windows partition detection and preservation; it is not a
 bootable Windows installation.
 
+--gap builds the same fixture with a hole in the partition numbering: a third
+partition is created and then deleted, leaving slot 3 free while slot 4 stays
+in use. parted fills the lowest free slot, so the installer must create its
+partitions as 3 and 5 and read those numbers back. The contiguous fixture
+cannot catch that class of bug, because there "lowest free" and "highest + 1"
+are the same number.
+
 Options:
   --recreate  Replace the existing test fixture
+  --gap       Build the numbering-hole variant (separate disk image)
   -h, --help  Show this help
 
 Paths can be overridden with:
@@ -43,6 +50,10 @@ while (( $# > 0 )); do
   case "$1" in
     --recreate)
       RECREATE=1
+      shift
+      ;;
+    --gap)
+      GAP=1
       shift
       ;;
     -h|--help)
@@ -65,6 +76,18 @@ while (( $# > 0 )); do
       ;;
   esac
 done
+
+# Separate images per layout so the two fixtures can coexist and neither has
+# to be rebuilt to run the other.
+if (( GAP )); then
+  TEST_DISK="${OMARCHY_ISO_TEST_WINDOWS_DISK:-/tmp/omarchy-iso-test-windows-gap.qcow2}"
+  TEST_OVMF_VARS="${OMARCHY_ISO_TEST_WINDOWS_OVMF_VARS:-/tmp/OVMF_VARS.omarchy-iso-test-windows-gap.fd}"
+  LAYOUT_LABEL="512MiB Windows ESP + data + deleted slot 3 + data + 64GiB+ free"
+else
+  TEST_DISK="${OMARCHY_ISO_TEST_WINDOWS_DISK:-/tmp/omarchy-iso-test-windows.qcow2}"
+  TEST_OVMF_VARS="${OMARCHY_ISO_TEST_WINDOWS_OVMF_VARS:-/tmp/OVMF_VARS.omarchy-iso-test-windows.fd}"
+  LAYOUT_LABEL="512MiB Windows ESP + existing data + 64GiB+ free"
+fi
 
 cleanup_mount() {
   if (( MOUNTED )); then
@@ -149,7 +172,7 @@ largest_free_region() {
 }
 
 validate_test_disk() {
-  local part_count pttype free_space_b min_free_b
+  local part_count pttype free_space_b min_free_b want_parts numbers
   local esp data valid=1
 
   [[ -f $TEST_DISK ]] || return 1
@@ -162,9 +185,17 @@ validate_test_disk() {
   pttype=$(lsblk -dnro PTTYPE "$ACTIVE_NBD" 2>/dev/null || true)
   free_space_b=$(largest_free_region "$ACTIVE_NBD")
   min_free_b=$((MIN_FREE_GIB * 1024 * 1024 * 1024))
+  want_parts=2
+  (( GAP )) && want_parts=3
 
   [[ $pttype == gpt ]] || valid=0
-  (( part_count == 2 )) || valid=0
+  (( part_count == want_parts )) || valid=0
+
+  # The whole point of the gap fixture: slot 3 free, slot 4 in use.
+  if (( GAP )); then
+    numbers=$(sudo parted -ms "$ACTIVE_NBD" unit B print 2>/dev/null | tail -n +3 | cut -d: -f1 | sort | tr '\n' ' ')
+    [[ $numbers == "1 2 4 " ]] || valid=0
+  fi
   (( free_space_b >= min_free_b )) || valid=0
   [[ $(sudo blkid -s TYPE -o value "$esp" 2>/dev/null || true) == vfat ]] || valid=0
   [[ $(sudo blkid -s LABEL -o value "$esp" 2>/dev/null || true) == WINDOWS_ESP ]] || valid=0
@@ -206,6 +237,18 @@ create_test_disk() {
   sudo parted --script "$ACTIVE_NBD" mkpart WINDOWS_ESP fat32 1MiB 513MiB
   sudo parted --script "$ACTIVE_NBD" set 1 esp on
   sudo parted --script "$ACTIVE_NBD" mkpart WINDOWS_DATA ext4 513MiB 20GiB
+
+  if (( GAP )); then
+    # Slot 3 is created and deleted, slot 4 stays. parted then fills 3 before
+    # 5, so an installer that assumes "highest + 1" (which would be 5 and 6)
+    # writes to device nodes that do not exist. The deleted region is
+    # deliberately smaller than the trailing free space so the installer still
+    # picks the tail as its largest free region.
+    sudo parted --script "$ACTIVE_NBD" mkpart SCRATCH ext4 20GiB 28GiB
+    sudo parted --script "$ACTIVE_NBD" mkpart WINDOWS_MORE ext4 28GiB 30GiB
+    sudo parted --script "$ACTIVE_NBD" rm 3
+  fi
+
   sudo partprobe "$ACTIVE_NBD"
   sudo udevadm settle
 
@@ -281,7 +324,7 @@ cp /usr/share/edk2/x64/OVMF_VARS.4m.fd "$TEST_OVMF_VARS"
 gum style --border rounded --padding "0 1" --border-foreground 6 \
   "Synthetic Windows disk ready" \
   "Disk: $TEST_DISK" \
-  "Layout: 512MiB Windows ESP + existing data + 64GiB+ free"
+  "Layout: $LAYOUT_LABEL"
 
 if gum confirm "Start installation on this disk?"; then
   ISO="$(select_iso)"
