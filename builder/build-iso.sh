@@ -5,12 +5,13 @@ set -e
 OMARCHY_ISO_REF="${OMARCHY_ISO_REF:-quattro}"
 OMARCHY_MIRROR="${OMARCHY_MIRROR:-stable}"
 
-# Quattro, edge, dev, and local-source ISOs install the dev packages explicitly.
-# Those package recipes track the quattro branch. This avoids relying on
-# pacman's provides=omarchy resolution and shows the real package names being
-# tested in the offline mirror and target install.
+# Edge, dev, and local-source ISOs install the dev packages explicitly. Those
+# package recipes track the quattro branch. This avoids relying on pacman's
+# provides=omarchy resolution and shows the real package names being tested in
+# the offline mirror and target install. Every other ref, the default quattro
+# build included, installs the published omarchy packages.
 case "$OMARCHY_ISO_REF" in
-  quattro|edge|dev|local)
+  edge|dev|local)
     : "${OMARCHY_RUNTIME_PACKAGE:=omarchy-dev}"
     : "${OMARCHY_SETTINGS_PACKAGE:=omarchy-settings-dev}"
     ;;
