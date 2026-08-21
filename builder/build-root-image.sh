@@ -44,11 +44,12 @@ if [[ ! -r $pacman_conf ]]; then
   exit 1
 fi
 
-# Must match the compress= option the installer mounts the target with
-# (configurator JSON mount_options / disk-partitioning.sh): the stream carries
-# the extents as compressed here, and the installed system keeps writing new
-# data at its own mount level either way.
-IMAGE_COMPRESS="compress=zstd:3"
+# Forced zstd at a higher level than the installer's own compress=zstd (level
+# 3): btrfs's incompressibility heuristic declines a lot of data in this tree
+# that zstd handles fine, and the level only costs build time. btrfs receive
+# stores the extents as they arrive, so neither choice affects install speed;
+# the installed system writes new data at its own mount option either way.
+IMAGE_COMPRESS="compress-force=zstd:15"
 # Name of the subvolume inside the stream. The orchestrator looks for this name
 # after `btrfs receive` (phases_impl.ROOT_IMAGE_SUBVOLUME).
 IMAGE_SUBVOLUME="omarchy-root"
