@@ -30,7 +30,7 @@ pacman --noconfirm -Sy archlinux-keyring
 # so this container can be months behind the mirror it installs from. A plain
 # -Sy install is then a partial upgrade — new packages linked against a glibc
 # the container doesn't have yet.
-pacman --noconfirm -Syu archiso git sudo base-devel jq grub imagemagick neovim nodejs npm tree-sitter-cli
+pacman --noconfirm -Syu archiso git sudo base-devel jq grub imagemagick neovim nodejs npm tree-sitter-cli btrfs-progs
 
 # Pre-import the omarchy signing key (so pacman trusts our [omarchy] repo
 # during the build without keyserver lookups).
@@ -51,7 +51,9 @@ fi
 # Build locations
 build_cache_dir=/var/cache
 offline_mirror_dir="$build_cache_dir/airootfs/var/cache/omarchy/mirror/offline"
-mkdir -p "$build_cache_dir" "$offline_mirror_dir"
+root_image_dir="$build_cache_dir/airootfs/var/cache/omarchy/rootfs"
+root_image_stream="$root_image_dir/omarchy-root.btrfs"
+mkdir -p "$build_cache_dir" "$offline_mirror_dir" "$root_image_dir"
 
 # Seed from the official Arch releng profile.
 cp -r /archiso/configs/releng/* "$build_cache_dir/"
@@ -102,6 +104,14 @@ fi
 if [[ -d /omarchy-source && -d /omarchy-pkgs ]]; then
   bash /builder/build-omarchy-packages.sh "$offline_mirror_dir"
   LOCAL_OMARCHY_BUILD=1
+  # A rebuild of the same revision produces the same filename with different
+  # bytes. pacman consults /var/cache/pacman/pkg (the host's cache, kept across
+  # --keep-pkg-cache builds) before the mirror, and a stale copy from an
+  # earlier build fails the checksum against the mirror's fresh db.
+  for local_package_name in \
+    "$OMARCHY_RUNTIME_PACKAGE" "$OMARCHY_SETTINGS_PACKAGE" "$OMARCHY_NVIM_PACKAGE"; do
+    rm -f /var/cache/pacman/pkg/"$local_package_name"-*.pkg.tar.zst{,.sig}
+  done
 fi
 
 # Node.js binary for offline mise install.
@@ -228,22 +238,101 @@ if ! download_offline_packages; then
   download_offline_packages
 fi
 
-# Resolve the exact filenames chosen by the same synced package databases used
-# for the download. Pruning by this transaction (rather than merely keeping the
-# newest version of every cached package name) removes packages that have left
-# the lists or dependency closure, such as an old Electron major version.
-if ! resolved_package_files="$(
-  pacman --config "/configs/pacman-online-${OMARCHY_MIRROR}.conf" --noconfirm \
-    --dbpath /tmp/offlinedb -S --print --print-format '%f' "${all_packages[@]}"
-)"; then
-  echo "ERROR: could not resolve the package files required by the offline mirror" >&2
+# Index the complete mirror so the root image can be pacstrapped from it.
+# mkarchiso expects the mirror at /var/cache/omarchy/mirror/offline inside the
+# container (the airootfs path); symlink rather than duplicate.
+rebuild_offline_repo_db() {
+  rm -f "$offline_mirror_dir"/offline.db* "$offline_mirror_dir"/offline.files*
+  repo-add -q "$offline_mirror_dir/offline.db.tar.gz" "$offline_mirror_dir/"*.pkg.tar.zst
+}
+rebuild_offline_repo_db
+mkdir -p /var/cache/omarchy/mirror
+ln -sfn "$offline_mirror_dir" /var/cache/omarchy/mirror/offline
+
+# Packages that differ per machine and therefore stay out of the root image:
+# the installer pacstraps them on the target after unpacking the image, and
+# omarchy-apply-system installs more from omarchy-other.packages as the
+# hardware dictates. Everything else the target gets is in the image.
+hardware_packages=(linux linux-t2 amd-ucode intel-ucode sof-firmware alsa-firmware tailscale)
+
+mapfile -t image_packages < <(
+  {
+    grep -hv '^#\|^$' /builder/archinstall.packages
+    grep -hv '^#\|^$' /builder/image.packages
+    # The shipped copy, which is what the install reads too.
+    grep -hv '^#\|^$' "$build_cache_dir/airootfs/usr/share/omarchy-iso/omarchy-base.packages"
+    printf '%s\n' "$OMARCHY_RUNTIME_PACKAGE" "$OMARCHY_SETTINGS_PACKAGE" "$OMARCHY_NVIM_PACKAGE"
+  } | sort -u | grep -Fxv "${hardware_packages[@]/#/-e}"
+)
+
+# pacstrap resolves the image against the offline repo and, with CacheDir on
+# the mirror itself, extracts the package files in place instead of copying
+# several GiB into a cache first (the same trick the installer's bind mount
+# plays on the target).
+image_pacman_conf="$build_cache_dir/pacman-root-image.conf"
+sed "/^\[options\]/a CacheDir = /var/cache/omarchy/mirror/offline/" \
+  "$build_cache_dir/pacman-offline.conf" >"$image_pacman_conf"
+
+image_localdb=/tmp/omarchy-root-image-localdb
+OMARCHY_IMAGE_LOCALDB_COPY="$image_localdb" \
+  bash /builder/build-root-image.sh "$image_pacman_conf" "$root_image_stream" "${image_packages[@]}"
+
+# Resolve the exact filenames the mirror must keep now that the image carries
+# the bulk of the target, against the complete offline repo just indexed so
+# the answer can only name files the mirror holds (the local omarchy builds
+# included):
+#   - the live ISO's own packages, against an empty root: mkarchiso pacstraps
+#     the live root from this mirror and needs their whole closure;
+#   - the per-machine packages and the hardware-dependent extras
+#     omarchy-apply-system may install from omarchy-other.packages, against
+#     the image's local db: only what the image does not already hold.
+# Dependencies the live closure shares with the image cost ISO space twice,
+# which is the price of keeping the mirror self-contained for the live
+# environment.
+resolve_mirror_files() {
+  local root="$1"
+  shift
+  mkdir -p "$root/var/lib/pacman"
+  pacman --config "$build_cache_dir/pacman-offline.conf" \
+    --root "$root" --dbpath "$root/var/lib/pacman" --noconfirm -Sy >/dev/null || return 1
+  pacman --config "$build_cache_dir/pacman-offline.conf" \
+    --root "$root" --dbpath "$root/var/lib/pacman" --noconfirm \
+    -S --print --print-format '%f' --needed "$@"
+}
+
+live_root=/tmp/omarchy-mirror-live
+rm -rf "$live_root"
+mapfile -t live_targets < <(sort -u "$build_cache_dir/packages.x86_64")
+if ! live_package_files="$(resolve_mirror_files "$live_root" "${live_targets[@]}")"; then
+  echo "ERROR: could not resolve the live ISO's packages from the offline mirror" >&2
   exit 1
 fi
-mapfile -t required_package_files <<< "$resolved_package_files"
+
+delta_root=/tmp/omarchy-mirror-delta
+rm -rf "$delta_root"
+mkdir -p "$delta_root/var/lib/pacman"
+cp -a "$image_localdb/local" "$delta_root/var/lib/pacman/"
+mapfile -t delta_targets < <(
+  {
+    grep -hv '^#\|^$' "${base_pkg_lists[1]}"
+    printf '%s\n' "${hardware_packages[@]}"
+  } | sort -u
+)
+if ! delta_package_files="$(resolve_mirror_files "$delta_root" "${delta_targets[@]}")"; then
+  echo "ERROR: could not resolve the per-machine packages from the offline mirror" >&2
+  exit 1
+fi
+
+mapfile -t required_package_files < <(
+  printf '%s\n%s\n' "$live_package_files" "$delta_package_files" | sort -u | grep .
+)
 
 # The online transaction intentionally excludes packages built from the local
 # checkouts. Add those exact artifacts back to the keep-set after verifying
 # that the local build left exactly one file for each selected package name.
+# The settings package is a live ISO package; the runtime and nvim packages
+# are only in the image now, but keeping all three in the mirror leaves
+# omarchy-apply-system able to resolve them like any published build.
 if [[ -n ${LOCAL_OMARCHY_BUILD:-} ]]; then
   for local_package_name in \
     "$OMARCHY_RUNTIME_PACKAGE" "$OMARCHY_SETTINGS_PACKAGE" "$OMARCHY_NVIM_PACKAGE"; do
@@ -271,43 +360,22 @@ printf '%s\n' "${required_package_files[@]}" |
 
 # Rebuild the offline repo db from scratch so size/checksum/depends entries
 # always reflect only the package files selected for this build.
-rm -f "$offline_mirror_dir"/offline.db* "$offline_mirror_dir"/offline.files*
-repo-add "$offline_mirror_dir/offline.db.tar.gz" "$offline_mirror_dir/"*.pkg.tar.zst
+rebuild_offline_repo_db
 
-# mkarchiso expects the mirror at /var/cache/omarchy/mirror/offline inside the
-# container (the airootfs path); symlink rather than duplicate.
-mkdir -p /var/cache/omarchy/mirror
-ln -sf "$offline_mirror_dir" /var/cache/omarchy/mirror/offline
-
-# Denominator for the install dashboard's progress bar. Resolving the mirror's
-# own package lists against the mirror we just indexed, with an empty local db,
-# is the question pacstrap asks at install time — same resolver, same repo, same
-# lists — so no hand-kept constant can drift.
-#
-# It over-counts by ~1 in 925: archinstall.packages lists both amd-ucode and
-# intel-ucode because the mirror must contain either. phases.py records expected
-# and actual in the timing JSON, so growing drift shows up in acceptance runs.
-# The early-bootstrap set is already inside this closure, so restating it would
-# only add a second list to drift.
+# Denominator for the install dashboard's progress bar: what the image holds
+# plus the kernel's closure on top of it, resolved against the image's own
+# local db with the pruned mirror, which is the question the installer's delta
+# pacstrap asks. Plus one for the microcode package every real machine gets.
+# phases.py records expected and actual in the timing JSON, so drift shows up
+# in acceptance runs.
 resolve_expected_packages() {
   local resolve_root=/tmp/omarchy-expected-packages
-  local resolved
-  local -a targets
+  local image_count resolved
 
   rm -rf "$resolve_root"
   mkdir -p "$resolve_root/var/lib/pacman"
-
-  mapfile -t targets < <(
-    {
-      grep -hv '^#\|^$' /builder/archinstall.packages
-      # Read the shipped copy, which is what _runtime_package_list reads at
-      # install time, not the build-time source it came from.
-      grep -hv '^#\|^$' \
-        "$build_cache_dir/airootfs/usr/share/omarchy-iso/omarchy-base.packages"
-      printf '%s\n' "$OMARCHY_RUNTIME_PACKAGE" "$OMARCHY_SETTINGS_PACKAGE" \
-        "$OMARCHY_NVIM_PACKAGE"
-    } | sort -u
-  )
+  cp -a "$image_localdb/local" "$resolve_root/var/lib/pacman/"
+  image_count=$(find "$resolve_root/var/lib/pacman/local" -mindepth 1 -maxdepth 1 -type d | wc -l)
 
   pacman --config "$build_cache_dir/pacman-offline.conf" \
     --root "$resolve_root" --dbpath "$resolve_root/var/lib/pacman" \
@@ -318,19 +386,20 @@ resolve_expected_packages() {
   # dashboard's fallback.
   resolved="$(pacman --config "$build_cache_dir/pacman-offline.conf" \
     --root "$resolve_root" --dbpath "$resolve_root/var/lib/pacman" \
-    --noconfirm -S --print --print-format '%n' "${targets[@]}")" || return 1
+    --noconfirm -S --print --print-format '%n' --needed linux)" || return 1
 
-  printf '%s\n' "$resolved" | sort -u | grep -c .
+  echo $(( image_count + $(printf '%s\n' "$resolved" | sort -u | grep -c .) + 1 ))
 }
 
 # Worth failing the build over: -S --print only aborts when a target is missing
-# from the offline repo, which would fail pacstrap the same way. A count that
-# merely looks wrong is not — the dashboard falls back without the file.
+# from the offline repo, which would fail the delta pacstrap the same way. A
+# count that merely looks wrong is not — the dashboard falls back without the
+# file.
 if ! expected_packages="$(resolve_expected_packages)"; then
   echo "ERROR: could not resolve the target package count from the offline mirror." >&2
   echo "       pacman -S --print aborts the whole transaction if any single target" >&2
-  echo "       is missing, so this almost certainly means pacstrap would fail the" >&2
-  echo "       same way at install time." >&2
+  echo "       is missing, so this almost certainly means the installer's delta" >&2
+  echo "       pacstrap would fail the same way." >&2
   exit 1
 fi
 if (( expected_packages < 600 || expected_packages > 2000 )); then

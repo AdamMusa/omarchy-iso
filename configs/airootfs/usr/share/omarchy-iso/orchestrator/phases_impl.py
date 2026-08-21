@@ -8,8 +8,8 @@ Phase ordering (full-disk and protected/pre-mounted):
     prepare_install_target → verify pre-mounted target/ESP when the JSON uses
                              pre_mounted_config; no-op for full-disk installs
     arch_install_system    → one archinstall flow for partition/mount-or-use,
-                             base install, early Omarchy packages, Limine setup,
-                             useradd, runtime Omarchy packages, fstab
+                             root image unpack (btrfs receive), per-machine
+                             package delta, Limine setup, useradd, fstab
     configure_hibernation  → root-owned swap/resume drop-ins
     run_system_finalizer   → arch-chroot root omarchy-apply-system, including Snapper
     finalize_limine_boot   → final Limine config/UKI build after hardware drop-ins
@@ -23,6 +23,7 @@ Phase ordering (full-disk and protected/pre-mounted):
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -35,6 +36,7 @@ from pathlib import Path
 from . import archinstall_adapter as arch
 from .context import InstallContext
 from .keyboard import configure_keyboard
+from .phases import write_state
 from .ui import error, info
 
 
@@ -116,43 +118,26 @@ def _omarchy_nvim_package() -> str:
     return _package_targets()["nvim"]
 
 
-# Packages installed BEFORE useradd. The selected omarchy-settings package and
-# omarchy-nvim populate /etc/skel so the user's home gets seeded correctly, and
-# omarchy-settings also ships the limine/snapper configs. Target-side setup
-# commands are installed later by the selected Omarchy runtime package and
-# executed in chroot.
-EARLY_BOOTSTRAP_BASE_PACKAGES = [
-    "base-devel",
-    "git",
-    "limine",
-    "efibootmgr",
-    "omarchy-keyring",
-]
+# The root image: a `btrfs send --compressed-data` stream of the invariant
+# target system (build-root-image.sh), unpacked onto the target in place of
+# pacstrapping it. The subvolume name is what build-root-image.sh sends.
+ROOT_IMAGE_STREAM = Path("/var/cache/omarchy/rootfs/omarchy-root.btrfs")
+ROOT_IMAGE_SUBVOLUME = "omarchy-root"
 
-# Install LuaRocks before omarchy-nvim pulls in lua51-lpeg. Arch's lua-luarocks
-# post_install script tries to rebuild manifests for existing rocks trees before
-# the unversioned luarocks-admin command exists if both arrive in the wrong
-# transaction order. Splitting this transaction avoids the harmless but noisy
-# "luarocks-admin: command not found" line during ISO installs.
-EARLY_LUAROCKS_PACKAGES = [
-    "lua51",
-    "luarocks",
-]
+# Packages the image must carry for the rest of the install to work: Limine
+# setup reads the settings package's limine config, useradd copies the skel the
+# settings and nvim packages populate, and the target-side setup commands come
+# from the runtime package. Checked right after unpacking so a mismatched
+# image fails here with a clear message instead of three phases later.
+ROOT_IMAGE_REQUIRED_PACKAGES = ("limine", "omarchy-keyring")
 
 
-def _early_bootstrap_packages() -> list[str]:
-    return [*EARLY_BOOTSTRAP_BASE_PACKAGES, _omarchy_settings_package()]
-
-
-def _early_user_seed_packages() -> list[str]:
-    return [_omarchy_nvim_package()]
-
-
-def _early_packages() -> list[str]:
+def _root_image_required_packages() -> list[str]:
     return [
-        *_early_bootstrap_packages(),
-        *EARLY_LUAROCKS_PACKAGES,
-        *_early_user_seed_packages(),
+        *ROOT_IMAGE_REQUIRED_PACKAGES,
+        _omarchy_runtime_package(),
+        _omarchy_settings_package(),
+        _omarchy_nvim_package(),
     ]
 
 
@@ -213,7 +198,9 @@ def prepare_install_target(ctx: InstallContext) -> None:
 
 
 def arch_install_system(ctx: InstallContext) -> None:
-    """Install the target system from the archinstall JSON.
+    """Install the target system: archinstall partitions and mounts per the
+    configurator JSON, the root image is unpacked onto the mounted layout, and
+    archinstall finishes with the per-machine package delta, users, and fstab.
 
     The phase sequence is the same for full-disk and protected installs. The
     JSON decides whether archinstall should create/mount a disk layout or use
@@ -240,6 +227,11 @@ def arch_install_system(ctx: InstallContext) -> None:
             skip_wkd=True,
         )
 
+        # Before anything writes into the target: the image replaces the
+        # (empty) root subvolume archinstall created, and everything written
+        # there first would go with it.
+        _install_root_image(ctx)
+
         if not pre_mounted and arch.is_encrypted(config):
             installer.generate_key_files()
 
@@ -249,23 +241,19 @@ def arch_install_system(ctx: InstallContext) -> None:
         _mount_offline_package_cache(ctx)
         _mask_mkinitcpio_pacman_hooks(ctx)
         try:
-            info("› installing base system (mkinitcpio deferred to final Limine UKI build)")
+            info("› installing per-machine packages (mkinitcpio deferred to final Limine UKI build)")
             # An empty kb_layout makes archinstall's set_keyboard_language skip
             # booting the target in a container just to run localectl; the
             # keymap is configured offline right after instead.
             kb_layout = config.locale_config.kb_layout if config.locale_config else ""
-            installer.minimal_installation(
-                optional_repositories=(
-                    config.mirror_config.optional_repositories
-                    if config.mirror_config else []
-                ),
-                mkinitcpio=False,
+            arch.install_base_delta(
+                installer,
+                config,
                 hostname=config.hostname,
                 locale_config=(
                     replace(config.locale_config, kb_layout="")
                     if config.locale_config else None
                 ),
-                pacman_config=config.pacman_config,
             )
 
             if not configure_keyboard(installer.target, kb_layout):
@@ -275,10 +263,9 @@ def arch_install_system(ctx: InstallContext) -> None:
                 installer.set_mirrors(mirror_handler, config.mirror_config, on_target=True)
 
             if config.swap and config.swap.enabled:
-                installer.setup_swap(algo=config.swap.algorithm)
+                arch.setup_zram_swap(installer)
                 _drop_archinstall_zram_conf(ctx)
 
-            _install_early_packages(installer)
             _configure_limine_boot(ctx, installer, config)
 
             info("› creating user (with /etc/skel populated)")
@@ -286,11 +273,11 @@ def arch_install_system(ctx: InstallContext) -> None:
                 installer.create_users(config.auth_config.users)
 
             if config.app_config:
-                info("› installing archinstall application selections")
+                # The image carries the PipeWire packages; this adds the audio
+                # firmware archinstall's hardware detection asks for and wires
+                # the per-user PipeWire units.
+                info("› applying archinstall application selections")
                 arch.install_applications(installer, config)
-
-            info("› installing Omarchy runtime + omarchy-base.packages")
-            installer.add_additional_packages(_runtime_package_list(ctx))
 
             # Tailscale is bundled in the offline mirror but only installed
             # when an autoinstall drive staged an auth key; must happen here,
@@ -315,6 +302,170 @@ def arch_install_system(ctx: InstallContext) -> None:
             _write_pre_mounted_fstab(ctx)
         else:
             installer.genfstab()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Root image: btrfs receive the build-time system into the target filesystem
+# and make it the @ subvolume.
+#
+# archinstall (or the configurator, for protected installs) has created and
+# mounted the subvolume layout by the time this runs: @ at the target, with
+# @home, @log, @pkg and the ESP mounted inside it. `btrfs receive` can only
+# create a new subvolume, never fill an existing one, so the image is received
+# at the filesystem's top level, snapshotted writable, and swapped in for the
+# empty @ while the layout is unmounted; then the layout is mounted again
+# exactly as it was. The mount table is replayed from findmnt rather than
+# asking archinstall to mount a second time, which would also unlock LUKS a
+# second time; the mapper stays open throughout.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _findmnt_mounts(root: Path) -> list[dict]:
+    """Every mount at or below root, parents before children, as dicts with
+    target/source/fstype/options."""
+    res = subprocess.run(
+        ["findmnt", "-R", "-J", "-o", "TARGET,SOURCE,FSTYPE,OPTIONS", str(root)],
+        capture_output=True, text=True, check=True,
+    )
+    flat: list[dict] = []
+
+    def walk(nodes):
+        for node in nodes:
+            flat.append({k: node.get(k) for k in ("target", "source", "fstype", "options")})
+            walk(node.get("children") or [])
+
+    walk(json.loads(res.stdout).get("filesystems") or [])
+    return flat
+
+
+def _remount_option_string(options: str) -> str:
+    # subvolid refers to the subvolume replaced here; subvol= names it.
+    return ",".join(opt for opt in options.split(",") if not opt.startswith("subvolid="))
+
+
+def _install_root_image(ctx: InstallContext) -> None:
+    target = ctx.target
+    if not ROOT_IMAGE_STREAM.is_file():
+        raise RuntimeError(f"root image stream missing: {ROOT_IMAGE_STREAM}")
+
+    mounts = _findmnt_mounts(target)
+    if not mounts or Path(mounts[0]["target"]) != target:
+        raise RuntimeError(f"{target} is not a mountpoint")
+    root_mount = mounts[0]
+    if root_mount["fstype"] != "btrfs":
+        raise RuntimeError(f"root image install needs a btrfs target root, got {root_mount['fstype']}")
+    root_options = (root_mount["options"] or "").split(",")
+    if not any(opt in ("subvol=/@", "subvol=@") for opt in root_options):
+        raise RuntimeError(f"root image install needs the target root on the @ subvolume, got {root_mount['options']}")
+    device = (root_mount["source"] or "").split("[")[0]
+    if not device:
+        raise RuntimeError(f"could not determine the btrfs device backing {target}")
+
+    top = ctx.state_dir / "image-top"
+    top.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["mount", "-o", "subvolid=5", device, str(top)], check=True)
+    try:
+        received = top / ROOT_IMAGE_SUBVOLUME
+        if received.exists():
+            subprocess.run(["btrfs", "subvolume", "delete", str(received)], check=True, capture_output=True)
+
+        info(f"› unpacking root image ({ROOT_IMAGE_STREAM.stat().st_size >> 20} MiB stream)")
+        _receive_root_image(ctx, top)
+
+        staged = top / "@.image"
+        if staged.exists():
+            subprocess.run(["btrfs", "subvolume", "delete", str(staged)], check=True, capture_output=True)
+        subprocess.run(["btrfs", "subvolume", "snapshot", str(received), str(staged)], check=True, capture_output=True)
+        subprocess.run(["btrfs", "subvolume", "delete", str(received)], check=True, capture_output=True)
+
+        # The image's pacman.log ends up under the @log mount; carry it over so
+        # the installed system's log starts with the packages it was built from.
+        image_log = staged / "var" / "log" / "pacman.log"
+        log_subvol = top / "@log"
+        if image_log.is_file() and log_subvol.is_dir():
+            shutil.copy2(image_log, log_subvol / "pacman.log")
+
+        info("› making the image the root subvolume")
+        _umount_tree(target)
+        try:
+            subprocess.run(["btrfs", "subvolume", "delete", str(top / "@")], check=True, capture_output=True)
+            staged.rename(top / "@")
+        finally:
+            for mount in mounts:
+                mountpoint = Path(mount["target"])
+                mountpoint.mkdir(parents=True, exist_ok=True)
+                source = (mount["source"] or "").split("[")[0]
+                subprocess.run(
+                    ["mount", "-t", mount["fstype"], "-o", _remount_option_string(mount["options"] or ""),
+                     source, str(mountpoint)],
+                    check=True,
+                )
+    finally:
+        subprocess.run(["umount", str(top)], check=False, capture_output=True)
+
+    missing = [pkg for pkg in _root_image_required_packages() if not arch.target_has_package(target, pkg)]
+    if missing:
+        raise RuntimeError(f"root image lacks required packages: {', '.join(missing)}")
+
+    # Per-machine identity the image deliberately ships without.
+    subprocess.run(["systemd-machine-id-setup", f"--root={target}"], check=True, capture_output=True)
+
+
+def _umount_tree(root: Path, attempts: int = 20) -> None:
+    """umount -R with a few retries: the dashboard polls the target's pacman
+    db from another process, and a poll landing mid-unmount is EBUSY."""
+    for attempt in range(1, attempts + 1):
+        res = subprocess.run(["umount", "-R", str(root)], capture_output=True, text=True)
+        if res.returncode == 0:
+            return
+        if attempt == attempts:
+            raise RuntimeError(f"could not unmount {root}: {res.stderr.strip()}")
+        time.sleep(0.25)
+
+
+def _receive_root_image(ctx: InstallContext, top: Path) -> None:
+    """Pipe the stream into btrfs receive, publishing progress for the
+    dashboard as a fraction of stream bytes consumed."""
+    total = ROOT_IMAGE_STREAM.stat().st_size
+    errors = ctx.state_dir / "btrfs-receive.err"
+    with errors.open("w") as err:
+        proc = subprocess.Popen(
+            ["btrfs", "receive", "-q", str(top)],
+            stdin=subprocess.PIPE,
+            stderr=err,
+        )
+    assert proc.stdin is not None
+    sent = 0
+    last_report = 0.0
+    try:
+        with ROOT_IMAGE_STREAM.open("rb") as stream:
+            while chunk := stream.read(8 << 20):
+                proc.stdin.write(chunk)
+                sent += len(chunk)
+                now = time.monotonic()
+                if now - last_report >= 0.5:
+                    _write_phase_progress(ctx, sent / total if total else 1.0)
+                    last_report = now
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass
+    if proc.wait() != 0:
+        raise RuntimeError(f"btrfs receive failed: {errors.read_text(errors='replace').strip()}")
+    _write_phase_progress(ctx, 1.0)
+
+
+def _write_phase_progress(ctx: InstallContext, fraction: float) -> None:
+    """Record how far the current phase has come (0..1) in the state file the
+    dashboard polls. Best effort: progress display must never fail an install."""
+    state_path = ctx.state_dir / "state.json"
+    try:
+        state = json.loads(state_path.read_text())
+    except (OSError, ValueError):
+        return
+    state["phase_progress"] = max(0.0, min(1.0, fraction))
+    try:
+        write_state(state_path, state)
+    except OSError:
+        pass
 
 
 def _configure_limine_boot(ctx: InstallContext, installer, config) -> None:
@@ -624,20 +775,6 @@ def _drop_archinstall_zram_conf(ctx: InstallContext) -> None:
     zram_conf.unlink(missing_ok=True)
 
 
-def _install_early_packages(installer) -> None:
-    bootstrap_packages = _early_bootstrap_packages()
-    user_seed_packages = _early_user_seed_packages()
-
-    info(f"› installing early Omarchy packages: {', '.join(bootstrap_packages)}")
-    installer.add_additional_packages(bootstrap_packages)
-
-    info(f"› installing LuaRocks prerequisites: {', '.join(EARLY_LUAROCKS_PACKAGES)}")
-    installer.add_additional_packages(EARLY_LUAROCKS_PACKAGES)
-
-    info(f"› installing user seed packages: {', '.join(user_seed_packages)}")
-    installer.add_additional_packages(user_seed_packages)
-
-
 def _mount_offline_package_cache(ctx: InstallContext) -> None:
     """Let pacstrap consume bundled packages without copying them first.
 
@@ -720,28 +857,6 @@ def _unmask_mkinitcpio_pacman_hooks(
                 backup.rename(path)
         except OSError as exc:
             info(f"warning: failed to restore pacman hook mask for {name}: {exc}")
-
-
-def _runtime_package_list(ctx: InstallContext) -> list[str]:
-    """Selected Omarchy runtime package + every package in the ISO-bundled
-    base package list that isn't already installed early."""
-    base_pkgs_file = Path("/usr/share/omarchy-iso/omarchy-base.packages")
-    pkgs = [_omarchy_runtime_package()]
-    already_installed = set(_early_packages()) | {
-        _omarchy_runtime_package(),
-        _omarchy_settings_package(),
-        _omarchy_nvim_package(),
-        "omarchy",
-        "omarchy-settings",
-        "omarchy-nvim",
-    }
-    for raw in base_pkgs_file.read_text().splitlines():
-        s = raw.strip()
-        if not s or s.startswith("#"):
-            continue
-        if s not in already_installed and s not in pkgs:
-            pkgs.append(s)
-    return pkgs
 
 
 # ─────────────────────────────────────────────────────────────────────────────

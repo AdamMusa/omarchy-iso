@@ -175,6 +175,9 @@ FINISH_TOP_ROW=2
 #          the install). libalpm makes one directory per package under
 #          <target>/var/lib/pacman/local; the denominator comes from
 #          build-iso.sh, so there is no second package list to drift.
+#          The root image unpack that precedes the package delta publishes
+#          phase_progress (stream bytes consumed) in the state file; it drives
+#          the same band until the local db fills in when the unpack lands.
 #
 # Per-mille because a whole-percent asymptote over a 2-point band has two
 # reachable values and stops moving. No give-up predicate: two discontinuous
@@ -293,7 +296,7 @@ count_packages() {
 # here would land on the TTY between the cursor escape and the bar.
 install_progress() {
   local phase finished index total target
-  local lo hi tau span t pos work gap n pkg_signal=0
+  local lo hi tau span t pos work gap n pkg_signal=0 progress_pm
   local -a state
 
   PROGRESS_PM=$POS
@@ -304,11 +307,14 @@ install_progress() {
     ((.finished_at // 0) | tonumber? // 0 | floor),
     ((.current_index // -1) | tonumber? // -1 | floor),
     ((.total_phases // 0) | tonumber? // 0 | floor),
-    (.target // "/mnt")
+    (.target // "/mnt"),
+    ((.phase_progress // -1) | tonumber? // -1 | . * 1000 | floor)
   ' "$STATE_FILE" 2>/dev/null)
-  (( ${#state[@]} == 5 )) || return 0
+  (( ${#state[@]} == 6 )) || return 0
   phase="${state[0]}" finished="${state[1]}"
   index="${state[2]}" total="${state[3]}" target="${state[4]}"
+  progress_pm="${state[5]}"
+  [[ $progress_pm =~ ^-?[0-9]+$ ]] || progress_pm=-1
   [[ -n $target ]] || target="/mnt"
 
   if (( finished > 0 )) || [[ $phase == "Installation complete" ]]; then
@@ -391,6 +397,11 @@ install_progress() {
     (( gap > PKG_BONUS_MAX_PM )) && gap=$PKG_BONUS_MAX_PM
     (( gap > PKG_BONUS )) && PKG_BONUS=$gap
     work=$(( lo + (span - 1 - PKG_TAIL_PM) * PKG_SEEN / PKG_TOTAL + PKG_BONUS ))
+    (( work > pos )) && pos=$work
+  fi
+  if (( progress_pm >= 0 )); then
+    (( progress_pm > 1000 )) && progress_pm=1000
+    work=$(( lo + (span - 1 - PKG_TAIL_PM) * progress_pm / 1000 ))
     (( work > pos )) && pos=$work
   fi
 

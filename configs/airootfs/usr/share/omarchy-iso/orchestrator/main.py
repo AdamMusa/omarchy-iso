@@ -19,9 +19,10 @@ from .ui import error, info
 def build_phases(ctx: InstallContext):
     """Phase order. Each entry is (display name, callable taking InstallContext).
 
-    The ordering is the whole point of this orchestrator: package-install
-    hooks (limine-mkinitcpio-hook, in particular) and useradd happen at
-    points where their prerequisites are guaranteed to be in place.
+    The ordering is the whole point of this orchestrator: the root image
+    unpack, package-install hooks (limine-mkinitcpio-hook, in particular) and
+    useradd happen at points where their prerequisites are guaranteed to be
+    in place.
 
     Full-disk and protected installs use the same phase sequence. The
     configurator only changes the JSON input: full-disk asks archinstall to
