@@ -86,13 +86,9 @@ class VerifyRootImageStreamTest(unittest.TestCase):
         self.checksum = self.dir / "omarchy-root.btrfs.sha256"
         self.ctx = types.SimpleNamespace(state_dir=self.dir / "state")
 
-        for name, value in (
-            ("ROOT_IMAGE_STREAM", self.stream),
-            ("ROOT_IMAGE_CHECKSUM", self.checksum),
-        ):
-            patch = mock.patch.object(phases_impl, name, value)
-            patch.start()
-            self.addCleanup(patch.stop)
+        patch = mock.patch.object(phases_impl, "ROOT_IMAGE_STREAM_CANDIDATES", (self.stream,))
+        patch.start()
+        self.addCleanup(patch.stop)
         for name in ("info", "_write_phase_progress"):
             patch = mock.patch.object(phases_impl, name)
             patch.start()
@@ -127,6 +123,26 @@ class VerifyRootImageStreamTest(unittest.TestCase):
         self.stream.write_bytes(data[: len(data) // 2])
         with self.assertRaisesRegex(RuntimeError, "corrupt"):
             phases_impl.verify_root_image_stream(self.ctx)
+
+
+class RootImageStreamLookupTest(unittest.TestCase):
+    def test_first_existing_candidate_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            iso = Path(tmp) / "bootmnt/omarchy-root.btrfs"
+            sfs = Path(tmp) / "rootfs/omarchy-root.btrfs"
+            sfs.parent.mkdir()
+            sfs.write_bytes(b"old")
+            with mock.patch.object(phases_impl, "ROOT_IMAGE_STREAM_CANDIDATES", (iso, sfs)):
+                self.assertEqual(phases_impl._root_image_stream(), sfs)
+                iso.parent.mkdir()
+                iso.write_bytes(b"new")
+                self.assertEqual(phases_impl._root_image_stream(), iso)
+
+    def test_no_candidate_lists_every_path(self):
+        with mock.patch.object(phases_impl, "ROOT_IMAGE_STREAM_CANDIDATES",
+                               (Path("/nonexistent/a"), Path("/nonexistent/b"))):
+            with self.assertRaisesRegex(RuntimeError, "stream missing.*/nonexistent/a.*/nonexistent/b"):
+                phases_impl._root_image_stream()
 
 
 class PrepareInstallTargetTest(unittest.TestCase):
@@ -205,7 +221,8 @@ class InstallRootImageTest(unittest.TestCase):
                 shutil.rmtree(cmd[3])
             return CompletedProcess(cmd, 0, stdout="", stderr="")
 
-        def fake_receive(ctx, top):
+        def fake_receive(ctx, top, stream_path):
+            self.assertEqual(stream_path, self.stream)
             self.calls.append(["btrfs", "receive", str(top)])
             received = top / phases_impl.ROOT_IMAGE_SUBVOLUME
             (received / "var/log").mkdir(parents=True)
@@ -222,7 +239,7 @@ class InstallRootImageTest(unittest.TestCase):
                               return_value=["limine", "omarchy-keyring", "omarchy"]),
             mock.patch.object(phases_impl.arch, "target_has_package", create=True,
                               side_effect=lambda target, pkg: pkg in self.received_packages),
-            mock.patch.object(phases_impl, "ROOT_IMAGE_STREAM", self.stream),
+            mock.patch.object(phases_impl, "ROOT_IMAGE_STREAM_CANDIDATES", (self.stream,)),
             mock.patch.object(phases_impl, "info"),
         ]
         for patch in patches:

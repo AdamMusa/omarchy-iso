@@ -123,11 +123,26 @@ def _omarchy_nvim_package() -> str:
 
 # The root image: a `btrfs send --compressed-data` stream of the invariant
 # target system (build-root-image.sh), unpacked onto the target in place of
-# pacstrapping it. The subvolume name is what build-root-image.sh sends.
-ROOT_IMAGE_STREAM = Path("/var/cache/omarchy/rootfs/omarchy-root.btrfs")
-# sha256sum output for the stream, written by build-iso.sh next to it.
-ROOT_IMAGE_CHECKSUM = ROOT_IMAGE_STREAM.with_name(ROOT_IMAGE_STREAM.name + ".sha256")
+# pacstrapping it. build-iso.sh ships it as a plain file on the ISO, read
+# straight off the boot medium; the squashfs location is where builds before
+# that move put it, kept so an older live root and a newer orchestrator (or
+# the reverse) still find the stream. The subvolume name is what
+# build-root-image.sh sends.
+ROOT_IMAGE_STREAM_CANDIDATES = (
+    Path("/run/archiso/bootmnt/arch/x86_64/omarchy-root.btrfs"),
+    Path("/var/cache/omarchy/rootfs/omarchy-root.btrfs"),
+)
+# build-iso.sh writes sha256sum output for the stream next to it.
+ROOT_IMAGE_CHECKSUM_SUFFIX = ".sha256"
 ROOT_IMAGE_SUBVOLUME = "omarchy-root"
+
+
+def _root_image_stream() -> Path:
+    for candidate in ROOT_IMAGE_STREAM_CANDIDATES:
+        if candidate.is_file():
+            return candidate
+    searched = ", ".join(str(c) for c in ROOT_IMAGE_STREAM_CANDIDATES)
+    raise RuntimeError(f"root image stream missing; looked at {searched}")
 
 # Packages the image must carry for the rest of the install to work: Limine
 # setup reads the settings package's limine config, useradd copies the skel the
@@ -239,23 +254,23 @@ def verify_root_image_stream(ctx: InstallContext) -> None:
     also trip btrfs receive's per-command checksums, but only after the disk
     is formatted. Reading the whole stream here also leaves as much of it as
     fits in the page cache for the unpack that follows."""
-    if not ROOT_IMAGE_STREAM.is_file():
-        raise RuntimeError(f"root image stream missing: {ROOT_IMAGE_STREAM}")
-    if not ROOT_IMAGE_CHECKSUM.is_file():
-        raise RuntimeError(f"root image checksum missing: {ROOT_IMAGE_CHECKSUM}")
+    stream_path = _root_image_stream()
+    checksum = stream_path.with_name(stream_path.name + ROOT_IMAGE_CHECKSUM_SUFFIX)
+    if not checksum.is_file():
+        raise RuntimeError(f"root image checksum missing: {checksum}")
 
     # sha256sum output: "<hex>  <filename>".
-    fields = ROOT_IMAGE_CHECKSUM.read_text().split()
+    fields = checksum.read_text().split()
     expected = fields[0].lower() if fields else ""
     if not re.fullmatch(r"[0-9a-f]{64}", expected):
-        raise RuntimeError(f"root image checksum unreadable: {ROOT_IMAGE_CHECKSUM}")
+        raise RuntimeError(f"root image checksum unreadable: {checksum}")
 
-    total = ROOT_IMAGE_STREAM.stat().st_size
-    info(f"› verifying root image ({total >> 20} MiB stream)")
+    total = stream_path.stat().st_size
+    info(f"› verifying root image ({total >> 20} MiB stream at {stream_path})")
     digest = hashlib.sha256()
     done = 0
     last_report = 0.0
-    with ROOT_IMAGE_STREAM.open("rb") as stream:
+    with stream_path.open("rb") as stream:
         while chunk := stream.read(8 << 20):
             digest.update(chunk)
             done += len(chunk)
@@ -267,7 +282,7 @@ def verify_root_image_stream(ctx: InstallContext) -> None:
     if actual != expected:
         raise RuntimeError(
             f"root image stream is corrupt: sha256 {actual} != {expected} "
-            f"({ROOT_IMAGE_STREAM}, {total} bytes); re-flash the install medium"
+            f"({stream_path}, {total} bytes); re-flash the install medium"
         )
 
 
@@ -437,8 +452,7 @@ def _root_image_target_mounts(target: Path) -> tuple[list[dict], str]:
 
 def _install_root_image(ctx: InstallContext) -> None:
     target = ctx.target
-    if not ROOT_IMAGE_STREAM.is_file():
-        raise RuntimeError(f"root image stream missing: {ROOT_IMAGE_STREAM}")
+    stream = _root_image_stream()
     mounts, device = _root_image_target_mounts(target)
 
     top = ctx.state_dir / "image-top"
@@ -449,8 +463,8 @@ def _install_root_image(ctx: InstallContext) -> None:
         if received.exists():
             subprocess.run(["btrfs", "subvolume", "delete", str(received)], check=True, capture_output=True)
 
-        info(f"› unpacking root image ({ROOT_IMAGE_STREAM.stat().st_size >> 20} MiB stream)")
-        _receive_root_image(ctx, top)
+        info(f"› unpacking root image ({stream.stat().st_size >> 20} MiB stream from {stream})")
+        _receive_root_image(ctx, top, stream)
 
         staged = top / "@.image"
         if staged.exists():
@@ -503,10 +517,10 @@ def _umount_tree(root: Path, attempts: int = 20) -> None:
         time.sleep(0.25)
 
 
-def _receive_root_image(ctx: InstallContext, top: Path) -> None:
+def _receive_root_image(ctx: InstallContext, top: Path, stream_path: Path) -> None:
     """Pipe the stream into btrfs receive, publishing progress for the
     dashboard as a fraction of stream bytes consumed."""
-    total = ROOT_IMAGE_STREAM.stat().st_size
+    total = stream_path.stat().st_size
     errors = ctx.state_dir / "btrfs-receive.err"
     with errors.open("w") as err:
         proc = subprocess.Popen(
@@ -518,7 +532,7 @@ def _receive_root_image(ctx: InstallContext, top: Path) -> None:
     sent = 0
     last_report = 0.0
     try:
-        with ROOT_IMAGE_STREAM.open("rb") as stream:
+        with stream_path.open("rb") as stream:
             while chunk := stream.read(8 << 20):
                 proc.stdin.write(chunk)
                 sent += len(chunk)
