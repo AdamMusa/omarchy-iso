@@ -277,55 +277,20 @@ image_localdb=/tmp/omarchy-root-image-localdb
 OMARCHY_IMAGE_LOCALDB_COPY="$image_localdb" \
   bash /builder/build-root-image.sh "$image_pacman_conf" "$root_image_stream" "${image_packages[@]}"
 
-# Resolve the exact filenames the mirror must keep now that the image carries
-# the bulk of the target, against the complete offline repo just indexed so
-# the answer can only name files the mirror holds (the local omarchy builds
-# included):
-#   - the live ISO's own packages, against an empty root: mkarchiso pacstraps
-#     the live root from this mirror and needs their whole closure;
-#   - the per-machine packages and the hardware-dependent extras
-#     omarchy-apply-system may install from omarchy-other.packages, against
-#     the image's local db: only what the image does not already hold.
-# Dependencies the live closure shares with the image cost ISO space twice,
-# which is the price of keeping the mirror self-contained for the live
-# environment.
-resolve_mirror_files() {
-  local root="$1"
-  shift
-  mkdir -p "$root/var/lib/pacman"
-  pacman --config "$build_cache_dir/pacman-offline.conf" \
-    --root "$root" --dbpath "$root/var/lib/pacman" --noconfirm -Sy >/dev/null || return 1
-  pacman --config "$build_cache_dir/pacman-offline.conf" \
-    --root "$root" --dbpath "$root/var/lib/pacman" --noconfirm \
-    -S --print --print-format '%f' --needed "$@"
-}
-
-live_root=/tmp/omarchy-mirror-live
-rm -rf "$live_root"
-mapfile -t live_targets < <(sort -u "$build_cache_dir/packages.x86_64")
-if ! live_package_files="$(resolve_mirror_files "$live_root" "${live_targets[@]}")"; then
-  echo "ERROR: could not resolve the live ISO's packages from the offline mirror" >&2
+# Resolve the exact filenames chosen by the same synced package databases used
+# for the download. Pruning by this transaction (rather than merely keeping the
+# newest version of every cached package name) removes packages that have left
+# the lists or dependency closure, such as an old Electron major version. This
+# is the build cache: it keeps the whole closure so the next build downloads
+# nothing; what the ISO ships is decided below.
+if ! resolved_package_files="$(
+  pacman --config "/configs/pacman-online-${OMARCHY_MIRROR}.conf" --noconfirm \
+    --dbpath /tmp/offlinedb -S --print --print-format '%f' "${all_packages[@]}"
+)"; then
+  echo "ERROR: could not resolve the package files required by the offline mirror" >&2
   exit 1
 fi
-
-delta_root=/tmp/omarchy-mirror-delta
-rm -rf "$delta_root"
-mkdir -p "$delta_root/var/lib/pacman"
-cp -a "$image_localdb/local" "$delta_root/var/lib/pacman/"
-mapfile -t delta_targets < <(
-  {
-    grep -hv '^#\|^$' "${base_pkg_lists[1]}"
-    printf '%s\n' "${hardware_packages[@]}"
-  } | sort -u
-)
-if ! delta_package_files="$(resolve_mirror_files "$delta_root" "${delta_targets[@]}")"; then
-  echo "ERROR: could not resolve the per-machine packages from the offline mirror" >&2
-  exit 1
-fi
-
-mapfile -t required_package_files < <(
-  printf '%s\n%s\n' "$live_package_files" "$delta_package_files" | sort -u | grep .
-)
+mapfile -t required_package_files <<< "$resolved_package_files"
 
 # The online transaction intentionally excludes packages built from the local
 # checkouts. Add those exact artifacts back to the keep-set after verifying
@@ -361,6 +326,39 @@ printf '%s\n' "${required_package_files[@]}" |
 # Rebuild the offline repo db from scratch so size/checksum/depends entries
 # always reflect only the package files selected for this build.
 rebuild_offline_repo_db
+
+# What the ISO ships out of this mirror. mkarchiso pacstraps the live root from
+# the complete mirror at build time, but at install time only packages the
+# root image does not already hold can ever be downloaded from it: the
+# per-machine packages, and whatever omarchy-apply-system adds from
+# omarchy-other.packages. So the live root's customize_airootfs.sh removes
+# every package file the image already provides, at the same version, from
+# its copy of the mirror. The repo db stays complete on purpose: the hardware
+# scripts run `pacman -S --needed` over lists that mix packages the image has
+# with ones it lacks, and pacman must still resolve every name, even the ones
+# it then skips as up to date.
+mirror_package_index() {
+  bsdtar -xOf "$offline_mirror_dir/offline.db.tar.gz" --include='*/desc' |
+    awk '/^%FILENAME%$/ { getline f } /^%NAME%$/ { getline n } /^%VERSION%$/ { getline v; print n "\t" v "\t" f }'
+}
+image_package_index() {
+  local desc
+  for desc in "$image_localdb"/local/*/desc; do
+    awk '/^%NAME%$/ { getline n } /^%VERSION%$/ { getline v; print n "\t" v }' "$desc"
+  done
+}
+shipped_list="$build_cache_dir/airootfs/usr/share/omarchy-iso/offline-mirror.shipped"
+awk -F'\t' '
+  NR == FNR { image[$1 "\t" $2] = 1; next }
+  !(($1 "\t" $2) in image) { print $3 }
+' <(image_package_index) <(mirror_package_index) | sort -u >"$shipped_list"
+shipped_count=$(grep -c . "$shipped_list")
+mirror_count=$(mirror_package_index | wc -l)
+if (( shipped_count == 0 || shipped_count >= mirror_count )); then
+  echo "ERROR: the shipped-mirror selection looks wrong: $shipped_count of $mirror_count packages" >&2
+  exit 1
+fi
+echo "Shipping $shipped_count of $mirror_count mirror packages; the root image provides the rest."
 
 # Denominator for the install dashboard's progress bar: what the image holds
 # plus the kernel's closure on top of it, resolved against the image's own
