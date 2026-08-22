@@ -12,7 +12,8 @@ Phase ordering (full-disk and protected/pre-mounted):
                              land on
     arch_install_system    → one archinstall flow for partition/mount-or-use,
                              root image unpack (btrfs receive), per-machine
-                             package delta, Limine setup, useradd, fstab
+                             package delta and pacman keyring, Limine setup,
+                             useradd, fstab
     configure_hibernation  → root-owned swap/resume drop-ins
     run_system_finalizer   → arch-chroot root omarchy-apply-system, including Snapper
     finalize_limine_boot   → final Limine config/UKI build after hardware drop-ins
@@ -379,6 +380,10 @@ def arch_install_system(ctx: InstallContext) -> None:
             _unmask_mkinitcpio_pacman_hooks(ctx)
             _unmount_offline_package_cache(ctx)
 
+        # After the last pacstrap: each one runs its own pacman-key --init on
+        # the target's gnupg dir.
+        _init_target_keyring(ctx)
+
         # Standard arch finishers.
         if config.timezone:
             installer.set_timezone(config.timezone)
@@ -503,6 +508,46 @@ def _install_root_image(ctx: InstallContext) -> None:
 
     # Per-machine identity the image deliberately ships without.
     subprocess.run(["systemd-machine-id-setup", f"--root={target}"], check=True, capture_output=True)
+
+
+def _init_target_keyring(ctx: InstallContext) -> None:
+    """Initialise and populate the target's per-machine pacman keyring.
+
+    The image ships no /etc/pacman.d/gnupg: its master key would be the same
+    on every install, and a shared signing key must never be distributed. On
+    a target pacstrapped directly, pacstrap -K initialised the keyring and
+    the keyring packages' scriptlets populated it; here those packages come
+    from the image, where their scriptlets ran with no keyring to populate.
+    The delta pacstrap's -K still ran --init (generating the master key), and
+    --init is idempotent, so run it again for installs that pacstrapped
+    nothing, then populate from the target's own keyring files.
+
+    Chroot-free: --gpgdir and --populate-from address the target directly,
+    so no API mounts are held. Nothing during the install reads this keyring
+    (the offline repo is SigLevel = Never); the installed system does. The
+    gpg-agent and dirmngr pacman-key starts hold sockets under the gnupg
+    dir and would keep the target busy at unmount, so kill them either way.
+    """
+    gpgdir = ctx.target / "etc" / "pacman.d" / "gnupg"
+    keyrings = ctx.target / "usr" / "share" / "pacman" / "keyrings"
+    info("› initializing per-machine pacman keyring")
+    try:
+        for step, args in (
+            ("--init", ["--init"]),
+            ("--populate", ["--populate-from", str(keyrings), "--populate", "archlinux", "omarchy"]),
+        ):
+            res = subprocess.run(
+                ["pacman-key", "--gpgdir", str(gpgdir), *args],
+                capture_output=True, text=True,
+            )
+            if res.returncode != 0:
+                raise RuntimeError(
+                    f"pacman-key {step} failed (exit {res.returncode}):\n"
+                    f"{(res.stderr or res.stdout).strip()}"
+                )
+    finally:
+        subprocess.run(["gpgconf", "--homedir", str(gpgdir), "--kill", "all"],
+                       check=False, capture_output=True)
 
 
 def _umount_tree(root: Path, attempts: int = 20) -> None:

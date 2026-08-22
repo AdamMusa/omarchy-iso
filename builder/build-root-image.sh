@@ -75,9 +75,10 @@ mnt="$work/mnt"
 loop=""
 masked_hooks=()
 
-# pacstrap -K runs pacman-key --init against the image's keyring, which starts
-# a gpg-agent for that homedir and leaves it running; until it is gone the
-# image cannot be unmounted.
+# Anything that touches a keyring under the image (pacman-key in a scriptlet,
+# say) starts a gpg-agent for that homedir and leaves it running; until it is
+# gone the image cannot be unmounted. Nothing should, as no keyring exists in
+# the image, but kill whatever did.
 stop_image_gpg_agents() {
   gpgconf --homedir "$mnt/$IMAGE_SUBVOLUME/etc/pacman.d/gnupg" --kill all 2>/dev/null || true
   pkill -f "$mnt/$IMAGE_SUBVOLUME/etc/pacman.d/gnupg" 2>/dev/null || true
@@ -146,12 +147,20 @@ root="$mnt/$IMAGE_SUBVOLUME"
 
 # -c: packages come straight from the config's CacheDir (the offline mirror),
 #     so nothing is copied into the image's own cache first.
-# -K: a keyring initialised for this image rather than the builder's copied in;
-#     the keyring packages populate it from their install scripts.
+# -G: no pacman keyring in the image, neither the builder's copied in nor one
+#     initialised here (-K): its master key would be the same on every
+#     install, and a shared signing key must never be distributed. The
+#     installer initialises and populates a per-machine keyring on the target
+#     (phases_impl._init_target_keyring), as pacstrap -K plus the keyring
+#     packages' scriptlets did when the target was pacstrapped directly.
 # -M: the builder's mirrorlist means nothing to an installed system; the
 #     installer writes the target's own.
-pacstrap -C "$pacman_conf" -c -K -M "$root" "${packages[@]}"
+pacstrap -C "$pacman_conf" -c -G -M "$root" "${packages[@]}"
 stop_image_gpg_agents
+# The keyring packages' scriptlets only populate an existing keyring, so with
+# -G they have nothing to do; remove whatever a scriptlet may have seeded
+# anyway rather than trust that.
+rm -rf "$root/etc/pacman.d/gnupg"
 
 # Per-machine identity is the installer's job, never the image's: it runs
 # systemd-machine-id-setup on the target after unpacking. Leave the id

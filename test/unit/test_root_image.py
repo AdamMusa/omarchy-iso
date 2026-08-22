@@ -341,5 +341,56 @@ class InstallRootImageTest(unittest.TestCase):
         self.assertTrue((self.top / "@").is_dir())
 
 
+class InitTargetKeyringTest(unittest.TestCase):
+    """The per-machine keyring the image deliberately ships without."""
+
+    def setUp(self):
+        self.target = Path("/mnt")
+        self.gpgdir = str(self.target / "etc/pacman.d/gnupg")
+        self.ctx = types.SimpleNamespace(target=self.target)
+        self.calls = []
+        self.fail_on = None
+
+        def fake_run(cmd, **kwargs):
+            self.calls.append(cmd)
+            if self.fail_on and self.fail_on in cmd:
+                return CompletedProcess(cmd, 1, stdout="", stderr="gpg: boom")
+            return CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        for patch in (
+            mock.patch.object(phases_impl.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(phases_impl, "info"),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_inits_then_populates_from_the_target_chroot_free(self):
+        phases_impl._init_target_keyring(self.ctx)
+        self.assertEqual(
+            self.calls,
+            [
+                ["pacman-key", "--gpgdir", self.gpgdir, "--init"],
+                ["pacman-key", "--gpgdir", self.gpgdir,
+                 "--populate-from", str(self.target / "usr/share/pacman/keyrings"),
+                 "--populate", "archlinux", "omarchy"],
+                ["gpgconf", "--homedir", self.gpgdir, "--kill", "all"],
+            ],
+        )
+        self.assertFalse(any("arch-chroot" in cmd for cmd in self.calls))
+
+    def test_populate_failure_raises_and_still_kills_gpg_daemons(self):
+        self.fail_on = "--populate"
+        with self.assertRaisesRegex(RuntimeError, r"(?s)pacman-key --populate failed.*gpg: boom"):
+            phases_impl._init_target_keyring(self.ctx)
+        self.assertEqual(self.calls[-1], ["gpgconf", "--homedir", self.gpgdir, "--kill", "all"])
+
+    def test_init_failure_skips_populate(self):
+        self.fail_on = "--init"
+        with self.assertRaisesRegex(RuntimeError, "pacman-key --init failed"):
+            phases_impl._init_target_keyring(self.ctx)
+        self.assertFalse(any("--populate" in cmd for cmd in self.calls))
+        self.assertEqual(self.calls[-1][0], "gpgconf")
+
+
 if __name__ == "__main__":
     unittest.main()
