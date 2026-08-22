@@ -204,6 +204,9 @@ mapfile -t all_packages < <(
     cat "$build_cache_dir/packages.x86_64"
     grep -hv '^#\|^$' "${base_pkg_lists[@]}"
     grep -hv '^#\|^$' /builder/archinstall.packages
+    # The root image is pacstrapped from the pruned mirror, so its packages
+    # must be in the keep-set even when nothing in the lists depends on them.
+    grep -hv '^#\|^$' /builder/image.packages
     # Always include the selected Omarchy packages so the target install can
     # find the runtime and companion packages in the offline mirror.
     printf '%s\n' "$OMARCHY_RUNTIME_PACKAGE" "$OMARCHY_SETTINGS_PACKAGE" "$OMARCHY_NVIM_PACKAGE"
@@ -238,49 +241,16 @@ if ! download_offline_packages; then
   download_offline_packages
 fi
 
-# Index the complete mirror so the root image can be pacstrapped from it.
 # mkarchiso expects the mirror at /var/cache/omarchy/mirror/offline inside the
-# container (the airootfs path); symlink rather than duplicate.
+# container (the airootfs path), and the root image is pacstrapped through the
+# same path; symlink rather than duplicate.
+mkdir -p /var/cache/omarchy/mirror
+ln -sfn "$offline_mirror_dir" /var/cache/omarchy/mirror/offline
+
 rebuild_offline_repo_db() {
   rm -f "$offline_mirror_dir"/offline.db* "$offline_mirror_dir"/offline.files*
   repo-add -q "$offline_mirror_dir/offline.db.tar.gz" "$offline_mirror_dir/"*.pkg.tar.zst
 }
-rebuild_offline_repo_db
-mkdir -p /var/cache/omarchy/mirror
-ln -sfn "$offline_mirror_dir" /var/cache/omarchy/mirror/offline
-
-# Packages that differ per machine and therefore stay out of the root image:
-# the installer pacstraps them on the target after unpacking the image, and
-# omarchy-apply-system installs more from omarchy-other.packages as the
-# hardware dictates. Everything else the target gets is in the image.
-hardware_packages=(linux linux-t2 amd-ucode intel-ucode sof-firmware alsa-firmware tailscale)
-
-mapfile -t image_packages < <(
-  {
-    grep -hv '^#\|^$' /builder/archinstall.packages
-    grep -hv '^#\|^$' /builder/image.packages
-    # The shipped copy, which is what the install reads too.
-    grep -hv '^#\|^$' "$build_cache_dir/airootfs/usr/share/omarchy-iso/omarchy-base.packages"
-    printf '%s\n' "$OMARCHY_RUNTIME_PACKAGE" "$OMARCHY_SETTINGS_PACKAGE" "$OMARCHY_NVIM_PACKAGE"
-  } | sort -u | grep -Fxv "${hardware_packages[@]/#/-e}"
-)
-
-# pacstrap resolves the image against the offline repo and, with CacheDir on
-# the mirror itself, extracts the package files in place instead of copying
-# several GiB into a cache first (the same trick the installer's bind mount
-# plays on the target).
-image_pacman_conf="$build_cache_dir/pacman-root-image.conf"
-sed "/^\[options\]/a CacheDir = /var/cache/omarchy/mirror/offline/" \
-  "$build_cache_dir/pacman-offline.conf" >"$image_pacman_conf"
-
-image_localdb=/tmp/omarchy-root-image-localdb
-OMARCHY_IMAGE_LOCALDB_COPY="$image_localdb" \
-  bash /builder/build-root-image.sh "$image_pacman_conf" "$root_image_stream" "${image_packages[@]}"
-
-# The installer verifies the stream against this before it touches the disk
-# (orchestrator prepare_install_target), so a truncated copy on a badly
-# flashed USB fails the install while it is still free to fail.
-(cd "$root_image_dir" && sha256sum "${root_image_stream##*/}" >"$root_image_stream.sha256")
 
 # Resolve the exact filenames chosen by the same synced package databases used
 # for the download. Pruning by this transaction (rather than merely keeping the
@@ -328,9 +298,46 @@ fi
 printf '%s\n' "${required_package_files[@]}" |
   bash /builder/prune-offline-mirror.sh "$offline_mirror_dir"
 
-# Rebuild the offline repo db from scratch so size/checksum/depends entries
-# always reflect only the package files selected for this build.
+# Index the mirror only now, from scratch, so size/checksum/depends entries
+# reflect only the package files selected for this build. The cache persists
+# across builds and can hold several versions of a package; repo-add keeps
+# whichever it processes last (a warning on downgrade, hidden by -q), and the
+# glob orders by name, not version. Indexing the unpruned cache could build the
+# root image from an older package than the mirror beside it advertises.
 rebuild_offline_repo_db
+
+# Packages that differ per machine and therefore stay out of the root image:
+# the installer pacstraps them on the target after unpacking the image, and
+# omarchy-apply-system installs more from omarchy-other.packages as the
+# hardware dictates. Everything else the target gets is in the image.
+hardware_packages=(linux linux-t2 amd-ucode intel-ucode sof-firmware alsa-firmware tailscale)
+
+mapfile -t image_packages < <(
+  {
+    grep -hv '^#\|^$' /builder/archinstall.packages
+    grep -hv '^#\|^$' /builder/image.packages
+    # The shipped copy, which is what the install reads too.
+    grep -hv '^#\|^$' "$build_cache_dir/airootfs/usr/share/omarchy-iso/omarchy-base.packages"
+    printf '%s\n' "$OMARCHY_RUNTIME_PACKAGE" "$OMARCHY_SETTINGS_PACKAGE" "$OMARCHY_NVIM_PACKAGE"
+  } | sort -u | grep -Fxv "${hardware_packages[@]/#/-e}"
+)
+
+# pacstrap resolves the image against the offline repo and, with CacheDir on
+# the mirror itself, extracts the package files in place instead of copying
+# several GiB into a cache first (the same trick the installer's bind mount
+# plays on the target).
+image_pacman_conf="$build_cache_dir/pacman-root-image.conf"
+sed "/^\[options\]/a CacheDir = /var/cache/omarchy/mirror/offline/" \
+  "$build_cache_dir/pacman-offline.conf" >"$image_pacman_conf"
+
+image_localdb=/tmp/omarchy-root-image-localdb
+OMARCHY_IMAGE_LOCALDB_COPY="$image_localdb" \
+  bash /builder/build-root-image.sh "$image_pacman_conf" "$root_image_stream" "${image_packages[@]}"
+
+# The installer verifies the stream against this before it touches the disk
+# (orchestrator prepare_install_target), so a truncated copy on a badly
+# flashed USB fails the install while it is still free to fail.
+(cd "$root_image_dir" && sha256sum "${root_image_stream##*/}" >"$root_image_stream.sha256")
 
 # What the ISO ships out of this mirror. mkarchiso pacstraps the live root from
 # the complete mirror at build time, but at install time only packages the
