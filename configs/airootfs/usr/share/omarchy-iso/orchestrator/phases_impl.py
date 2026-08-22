@@ -5,8 +5,11 @@ Phase ordering (full-disk and protected/pre-mounted):
     prepare_live           → disk cleanup when wiping, load configurator
                              handlers (archinstall patch happens in the
                              wrapper before Python imports it)
-    prepare_install_target → verify pre-mounted target/ESP when the JSON uses
-                             pre_mounted_config; no-op for full-disk installs
+    prepare_install_target → everything that can fail before the disk is
+                             touched: the pre-mounted target/ESP when the JSON
+                             uses pre_mounted_config, the root image stream
+                             and its checksum, and a disk layout the image can
+                             land on
     arch_install_system    → one archinstall flow for partition/mount-or-use,
                              root image unpack (btrfs receive), per-machine
                              package delta, Limine setup, useradd, fstab
@@ -122,6 +125,8 @@ def _omarchy_nvim_package() -> str:
 # target system (build-root-image.sh), unpacked onto the target in place of
 # pacstrapping it. The subvolume name is what build-root-image.sh sends.
 ROOT_IMAGE_STREAM = Path("/var/cache/omarchy/rootfs/omarchy-root.btrfs")
+# sha256sum output for the stream, written by build-iso.sh next to it.
+ROOT_IMAGE_CHECKSUM = ROOT_IMAGE_STREAM.with_name(ROOT_IMAGE_STREAM.name + ".sha256")
 ROOT_IMAGE_SUBVOLUME = "omarchy-root"
 
 # Packages the image must carry for the rest of the install to work: Limine
@@ -193,8 +198,77 @@ def _install_disk(ctx: InstallContext) -> str | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def prepare_install_target(ctx: InstallContext) -> None:
+    """Everything that can fail before the disk is touched. The next phase
+    partitions, formats and encrypts as its first step, and a failure after
+    that leaves a wiped (or wiped and encrypted) disk with no system on it:
+    so the stream, its checksum and a layout the image can land on are all
+    checked here, where failing costs nothing."""
     if ctx.is_protected:
         verify_protected_mounts(ctx)
+        # The protected layout exists already; check the real mounts.
+        _root_image_target_mounts(ctx.target)
+    else:
+        verify_root_image_layout(ctx.user_configuration.get("disk_config") or {})
+    verify_root_image_stream(ctx)
+
+
+def verify_root_image_layout(disk_config: dict) -> None:
+    """The root image replaces the target's @ subvolume, so the configurator
+    JSON must put the root on a btrfs @ subvolume, and the image path has no
+    LVM support (install_base_delta). Checked from the JSON so a layout the
+    image cannot land on fails before archinstall creates it."""
+    if disk_config.get("lvm_config"):
+        raise RuntimeError("root image install does not support LVM layouts")
+
+    for mod in disk_config.get("device_modifications") or []:
+        for part in mod.get("partitions") or []:
+            if part.get("fs_type") != "btrfs":
+                continue
+            for subvol in part.get("btrfs") or []:
+                if subvol.get("mountpoint") == "/" and subvol.get("name") in ("@", "/@"):
+                    return
+    raise RuntimeError(
+        "root image install needs the target root on a btrfs @ subvolume; "
+        "disk_config mounts / from no such subvolume"
+    )
+
+
+def verify_root_image_stream(ctx: InstallContext) -> None:
+    """The stream is present and hashes to what the build recorded. A
+    truncated or corrupt copy (a badly flashed USB is the common case) would
+    also trip btrfs receive's per-command checksums, but only after the disk
+    is formatted. Reading the whole stream here also leaves as much of it as
+    fits in the page cache for the unpack that follows."""
+    if not ROOT_IMAGE_STREAM.is_file():
+        raise RuntimeError(f"root image stream missing: {ROOT_IMAGE_STREAM}")
+    if not ROOT_IMAGE_CHECKSUM.is_file():
+        raise RuntimeError(f"root image checksum missing: {ROOT_IMAGE_CHECKSUM}")
+
+    # sha256sum output: "<hex>  <filename>".
+    fields = ROOT_IMAGE_CHECKSUM.read_text().split()
+    expected = fields[0].lower() if fields else ""
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise RuntimeError(f"root image checksum unreadable: {ROOT_IMAGE_CHECKSUM}")
+
+    total = ROOT_IMAGE_STREAM.stat().st_size
+    info(f"› verifying root image ({total >> 20} MiB stream)")
+    digest = hashlib.sha256()
+    done = 0
+    last_report = 0.0
+    with ROOT_IMAGE_STREAM.open("rb") as stream:
+        while chunk := stream.read(8 << 20):
+            digest.update(chunk)
+            done += len(chunk)
+            now = time.monotonic()
+            if now - last_report >= 0.5:
+                _write_phase_progress(ctx, done / total if total else 1.0)
+                last_report = now
+    actual = digest.hexdigest()
+    if actual != expected:
+        raise RuntimeError(
+            f"root image stream is corrupt: sha256 {actual} != {expected} "
+            f"({ROOT_IMAGE_STREAM}, {total} bytes); re-flash the install medium"
+        )
 
 
 def arch_install_system(ctx: InstallContext) -> None:
@@ -342,11 +416,10 @@ def _remount_option_string(options: str) -> str:
     return ",".join(opt for opt in options.split(",") if not opt.startswith("subvolid="))
 
 
-def _install_root_image(ctx: InstallContext) -> None:
-    target = ctx.target
-    if not ROOT_IMAGE_STREAM.is_file():
-        raise RuntimeError(f"root image stream missing: {ROOT_IMAGE_STREAM}")
-
+def _root_image_target_mounts(target: Path) -> tuple[list[dict], str]:
+    """The mount table under target, checked for what the image swap needs:
+    target itself mounted, btrfs, on the @ subvolume. Returns the mounts and
+    the device backing the root."""
     mounts = _findmnt_mounts(target)
     if not mounts or Path(mounts[0]["target"]) != target:
         raise RuntimeError(f"{target} is not a mountpoint")
@@ -359,6 +432,14 @@ def _install_root_image(ctx: InstallContext) -> None:
     device = (root_mount["source"] or "").split("[")[0]
     if not device:
         raise RuntimeError(f"could not determine the btrfs device backing {target}")
+    return mounts, device
+
+
+def _install_root_image(ctx: InstallContext) -> None:
+    target = ctx.target
+    if not ROOT_IMAGE_STREAM.is_file():
+        raise RuntimeError(f"root image stream missing: {ROOT_IMAGE_STREAM}")
+    mounts, device = _root_image_target_mounts(target)
 
     top = ctx.state_dir / "image-top"
     top.mkdir(parents=True, exist_ok=True)

@@ -277,6 +277,11 @@ image_localdb=/tmp/omarchy-root-image-localdb
 OMARCHY_IMAGE_LOCALDB_COPY="$image_localdb" \
   bash /builder/build-root-image.sh "$image_pacman_conf" "$root_image_stream" "${image_packages[@]}"
 
+# The installer verifies the stream against this before it touches the disk
+# (orchestrator prepare_install_target), so a truncated copy on a badly
+# flashed USB fails the install while it is still free to fail.
+(cd "$root_image_dir" && sha256sum "${root_image_stream##*/}" >"$root_image_stream.sha256")
+
 # Resolve the exact filenames chosen by the same synced package databases used
 # for the download. Pruning by this transaction (rather than merely keeping the
 # newest version of every cached package name) removes packages that have left
