@@ -111,6 +111,14 @@ trap cleanup EXIT
 mkdir -p /etc/pacman.d/hooks
 for hook in "${deferred_boot_hooks[@]}"; do
   path="/etc/pacman.d/hooks/$hook"
+  # Already masked: an earlier run died before its cleanup. Moving the mask
+  # over that run's backup would lose the real hook for good, so leave both
+  # for it to be restored by hand (the orchestrator's _is_devnull_symlink
+  # makes the same call).
+  if [[ -L $path && $(readlink "$path") == /dev/null ]]; then
+    echo "WARNING: $path is already masked; leaving it and any backup alone" >&2
+    continue
+  fi
   if [[ -e $path || -L $path ]]; then
     mv -f "$path" "$path.omarchy-backup"
   fi
