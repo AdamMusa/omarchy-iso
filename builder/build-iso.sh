@@ -364,7 +364,8 @@ awk -F'\t' '
   NR == FNR { image[$1 "\t" $2] = 1; next }
   !(($1 "\t" $2) in image) { print $3 }
 ' <(image_package_index) <(mirror_package_index) | sort -u >"$shipped_list"
-shipped_count=$(grep -c . "$shipped_list")
+# grep -c exits 1 on no match; the count check below wants the 0.
+shipped_count=$(grep -c . "$shipped_list" || true)
 mirror_count=$(mirror_package_index | wc -l)
 if (( shipped_count == 0 || shipped_count >= mirror_count )); then
   echo "ERROR: the shipped-mirror selection looks wrong: $shipped_count of $mirror_count packages" >&2
@@ -401,10 +402,12 @@ resolve_expected_packages() {
   echo $(( image_count + $(printf '%s\n' "$resolved" | sort -u | grep -c .) + 1 ))
 }
 
-# Worth failing the build over: -S --print only aborts when a target is missing
-# from the offline repo, which would fail the delta pacstrap the same way. A
-# count that merely looks wrong is not — the dashboard falls back without the
-# file.
+# Both failures are worth the build: -S --print only aborts when a target is
+# missing from the offline repo, which would fail the delta pacstrap the same
+# way, and the count is image packages plus the kernel closure, so one outside
+# the plausible range means the root image itself is short of packages. (The
+# dashboard falls back to a time-based curve without the file, but nothing
+# else would catch a short image before an install.)
 if ! expected_packages="$(resolve_expected_packages)"; then
   echo "ERROR: could not resolve the target package count from the offline mirror." >&2
   echo "       pacman -S --print aborts the whole transaction if any single target" >&2
@@ -413,14 +416,14 @@ if ! expected_packages="$(resolve_expected_packages)"; then
   exit 1
 fi
 if (( expected_packages < 600 || expected_packages > 2000 )); then
-  echo "WARNING: resolved target package count $expected_packages is outside the" >&2
-  echo "         expected 600-2000 range; shipping no denominator so the install" >&2
-  echo "         dashboard falls back to its time-based curve." >&2
-else
-  printf '%s\n' "$expected_packages" \
-    >"$build_cache_dir/airootfs/usr/share/omarchy-iso/expected-packages"
-  echo "Target install resolves to $expected_packages packages."
+  echo "ERROR: resolved target package count $expected_packages is outside the" >&2
+  echo "       expected 600-2000 range. The count is the image's package count" >&2
+  echo "       plus the kernel closure, so this means the root image is short." >&2
+  exit 1
 fi
+printf '%s\n' "$expected_packages" \
+  >"$build_cache_dir/airootfs/usr/share/omarchy-iso/expected-packages"
+echo "Target install resolves to $expected_packages packages."
 
 # Live ISO uses the same offline pacman.conf.
 cp "$build_cache_dir/pacman-offline.conf" "$build_cache_dir/airootfs/etc/pacman.conf"
