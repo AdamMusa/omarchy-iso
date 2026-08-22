@@ -341,55 +341,99 @@ class InstallRootImageTest(unittest.TestCase):
         self.assertTrue((self.top / "@").is_dir())
 
 
-class InitTargetKeyringTest(unittest.TestCase):
-    """The per-machine keyring the image deliberately ships without."""
+class FakeUnitProc:
+    """What Popen(systemd-run --wait --pipe ...) hands back."""
+
+    def __init__(self, returncode=0, output=""):
+        self.returncode = returncode
+        self.output = output
+        self.joined = 0
+
+    def communicate(self):
+        self.joined += 1
+        return self.output, None
+
+
+class TargetKeyringUnitTest(unittest.TestCase):
+    """The per-machine keyring the image deliberately ships without, run as
+    a transient unit and joined before the factory snapshot."""
 
     def setUp(self):
         self.target = Path("/mnt")
-        self.gpgdir = str(self.target / "etc/pacman.d/gnupg")
-        self.ctx = types.SimpleNamespace(target=self.target)
-        self.calls = []
-        self.fail_on = None
+        self.ctx = types.SimpleNamespace(target=self.target, state={})
+        self.runs = []
+        self.popens = []
 
         def fake_run(cmd, **kwargs):
-            self.calls.append(cmd)
-            if self.fail_on and self.fail_on in cmd:
-                return CompletedProcess(cmd, 1, stdout="", stderr="gpg: boom")
+            self.runs.append(cmd)
             return CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        def fake_popen(cmd, **kwargs):
+            self.popens.append((cmd, kwargs))
+            return FakeUnitProc()
 
         for patch in (
             mock.patch.object(phases_impl.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(phases_impl.subprocess, "Popen", side_effect=fake_popen),
             mock.patch.object(phases_impl, "info"),
         ):
             patch.start()
             self.addCleanup(patch.stop)
 
-    def test_inits_then_populates_from_the_target_chroot_free(self):
-        phases_impl._init_target_keyring(self.ctx)
+    def test_start_runs_init_then_populate_in_a_waited_unit(self):
+        phases_impl._start_target_keyring_init(self.ctx)
+
+        self.assertEqual(self.runs, [["systemctl", "reset-failed", "omarchy-target-keyring"]])
+        (cmd, kwargs), = self.popens
         self.assertEqual(
-            self.calls,
-            [
-                ["pacman-key", "--gpgdir", self.gpgdir, "--init"],
-                ["pacman-key", "--gpgdir", self.gpgdir,
-                 "--populate-from", str(self.target / "usr/share/pacman/keyrings"),
-                 "--populate", "archlinux", "omarchy"],
-                ["gpgconf", "--homedir", self.gpgdir, "--kill", "all"],
-            ],
+            cmd[:6],
+            ["systemd-run", "--wait", "--pipe", "--collect", "--quiet", "--unit=omarchy-target-keyring"],
         )
-        self.assertFalse(any("arch-chroot" in cmd for cmd in self.calls))
+        self.assertEqual(cmd[6:8], ["sh", "-c"])
+        self.assertEqual(
+            cmd[8],
+            "pacman-key --gpgdir /mnt/etc/pacman.d/gnupg --init && "
+            "pacman-key --gpgdir /mnt/etc/pacman.d/gnupg "
+            "--populate-from /mnt/usr/share/pacman/keyrings --populate archlinux omarchy",
+        )
+        self.assertNotIn("arch-chroot", cmd[8])
+        self.assertIs(kwargs["stderr"], phases_impl.subprocess.STDOUT)
+        self.assertIsInstance(self.ctx.state["target_keyring_proc"], FakeUnitProc)
 
-    def test_populate_failure_raises_and_still_kills_gpg_daemons(self):
-        self.fail_on = "--populate"
-        with self.assertRaisesRegex(RuntimeError, r"(?s)pacman-key --populate failed.*gpg: boom"):
-            phases_impl._init_target_keyring(self.ctx)
-        self.assertEqual(self.calls[-1], ["gpgconf", "--homedir", self.gpgdir, "--kill", "all"])
+    def test_join_waits_once_and_clears_state(self):
+        proc = FakeUnitProc()
+        self.ctx.state["target_keyring_proc"] = proc
+        phases_impl._join_target_keyring_init(self.ctx)
+        phases_impl._join_target_keyring_init(self.ctx)  # no-op: nothing pending
+        self.assertEqual(proc.joined, 1)
+        self.assertNotIn("target_keyring_proc", self.ctx.state)
 
-    def test_init_failure_skips_populate(self):
-        self.fail_on = "--init"
-        with self.assertRaisesRegex(RuntimeError, "pacman-key --init failed"):
-            phases_impl._init_target_keyring(self.ctx)
-        self.assertFalse(any("--populate" in cmd for cmd in self.calls))
-        self.assertEqual(self.calls[-1][0], "gpgconf")
+    def test_join_raises_with_the_unit_output(self):
+        self.ctx.state["target_keyring_proc"] = FakeUnitProc(returncode=1, output="gpg: boom\n")
+        with self.assertRaisesRegex(RuntimeError, r"(?s)keyring init failed \(exit 1\).*gpg: boom"):
+            phases_impl._join_target_keyring_init(self.ctx)
+        self.assertNotIn("target_keyring_proc", self.ctx.state)
+
+    def test_stop_ends_the_unit_and_never_raises(self):
+        proc = FakeUnitProc(returncode=1, output="killed")
+        self.ctx.state["target_keyring_proc"] = proc
+        phases_impl.stop_target_keyring_init(self.ctx)
+        self.assertEqual(self.runs, [["systemctl", "stop", "omarchy-target-keyring"]])
+        self.assertEqual(proc.joined, 1)
+        self.assertNotIn("target_keyring_proc", self.ctx.state)
+
+    def test_stop_without_a_unit_touches_nothing(self):
+        phases_impl.stop_target_keyring_init(self.ctx)
+        self.assertEqual(self.runs, [])
+
+    def test_factory_snapshot_joins_the_unit_before_anything_else(self):
+        # Even when the snapshot itself is skipped, the join runs: a failed
+        # keyring must fail the install.
+        self.ctx.state["target_keyring_proc"] = FakeUnitProc(returncode=1, output="gpg: boom")
+        with mock.patch.object(phases_impl, "_findmnt_value", return_value="ext4"):
+            with self.assertRaisesRegex(RuntimeError, "keyring init failed"):
+                phases_impl.create_factory_snapshot(self.ctx)
+        self.assertEqual(self.runs, [])
 
 
 if __name__ == "__main__":

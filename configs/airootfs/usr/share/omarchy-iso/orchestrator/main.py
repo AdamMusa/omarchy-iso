@@ -82,6 +82,7 @@ def main() -> int:
         cleanup_protected_state,
         cleanup_target_hook_masks,
         restore_cpu_governors,
+        stop_target_keyring_init,
     )
 
     governors = boost_cpu_governor()
@@ -102,6 +103,9 @@ def main() -> int:
         return 0
     finally:
         restore_cpu_governors(governors)
+        # No-op after a completed install (create_factory_snapshot joined it);
+        # on a failure it ends the unit before the target is torn down.
+        stop_target_keyring_init(ctx)
         cleanup_bind_mounts(ctx)
         cleanup_target_hook_masks(ctx)
         if not success:

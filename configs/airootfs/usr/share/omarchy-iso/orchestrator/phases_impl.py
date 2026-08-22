@@ -12,8 +12,9 @@ Phase ordering (full-disk and protected/pre-mounted):
                              land on
     arch_install_system    → one archinstall flow for partition/mount-or-use,
                              root image unpack (btrfs receive), per-machine
-                             package delta and pacman keyring, Limine setup,
-                             useradd, fstab
+                             package delta, Limine setup, useradd, fstab; the
+                             per-machine pacman keyring starts as a transient
+                             systemd unit after the last pacstrap
     configure_hibernation  → root-owned swap/resume drop-ins
     run_system_finalizer   → arch-chroot root omarchy-apply-system, including Snapper
     finalize_limine_boot   → final Limine config/UKI build after hardware drop-ins
@@ -22,6 +23,7 @@ Phase ordering (full-disk and protected/pre-mounted):
     configure_ssh_access   → authorized_keys for autoinstall; no-op otherwise
     configure_tailscale    → tailnet join staged for first boot; no-op otherwise
     validate_boot          → assert UKI / limine.conf / kernel cmdline are sane
+    create_factory_snapshot→ joins the keyring unit, then snapshots @ as @factory
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import textwrap
@@ -381,8 +384,9 @@ def arch_install_system(ctx: InstallContext) -> None:
             _unmount_offline_package_cache(ctx)
 
         # After the last pacstrap: each one runs its own pacman-key --init on
-        # the target's gnupg dir.
-        _init_target_keyring(ctx)
+        # the target's gnupg dir. Runs on while the phases below configure the
+        # target; create_factory_snapshot joins it.
+        _start_target_keyring_init(ctx)
 
         # Standard arch finishers.
         if config.timezone:
@@ -510,8 +514,13 @@ def _install_root_image(ctx: InstallContext) -> None:
     subprocess.run(["systemd-machine-id-setup", f"--root={target}"], check=True, capture_output=True)
 
 
-def _init_target_keyring(ctx: InstallContext) -> None:
-    """Initialise and populate the target's per-machine pacman keyring.
+# Transient systemd unit that initialises the target's pacman keyring.
+TARGET_KEYRING_UNIT = "omarchy-target-keyring"
+
+
+def _start_target_keyring_init(ctx: InstallContext) -> None:
+    """Initialise and populate the target's per-machine pacman keyring, as a
+    transient systemd unit that runs on while the install continues.
 
     The image ships no /etc/pacman.d/gnupg: its master key would be the same
     on every install, and a shared signing key must never be distributed. On
@@ -520,34 +529,62 @@ def _init_target_keyring(ctx: InstallContext) -> None:
     from the image, where their scriptlets ran with no keyring to populate.
     The delta pacstrap's -K still ran --init (generating the master key), and
     --init is idempotent, so run it again for installs that pacstrapped
-    nothing, then populate from the target's own keyring files.
+    nothing, then populate from the target's own keyring files. Chroot-free:
+    --gpgdir and --populate-from address the target directly, so no API
+    mounts are held.
 
-    Chroot-free: --gpgdir and --populate-from address the target directly,
-    so no API mounts are held. Nothing during the install reads this keyring
-    (the offline repo is SigLevel = Never); the installed system does. The
-    gpg-agent and dirmngr pacman-key starts hold sockets under the gnupg
-    dir and would keep the target busy at unmount, so kill them either way.
+    Started after the last pacstrap (each runs its own --init on this dir)
+    and joined by create_factory_snapshot: nothing in between reads the
+    keyring (the offline repo is SigLevel = Never) or writes it, and the
+    snapshot must not capture it half-written. A unit rather than a plain
+    child process: pacman-key leaves a gpg-agent and dirmngr behind, which
+    systemd kills with the rest of the unit's cgroup the moment pacman-key
+    exits (sockets under the target's gnupg dir would otherwise block the
+    unmount); the dashboard's process-group kill does not reach it, while
+    `systemctl stop` still does (stop_target_keyring_init); and its output
+    is in the journal whatever happens to the orchestrator. --wait --pipe
+    give a child to join with the unit's exit status and output.
     """
-    gpgdir = ctx.target / "etc" / "pacman.d" / "gnupg"
-    keyrings = ctx.target / "usr" / "share" / "pacman" / "keyrings"
-    info("› initializing per-machine pacman keyring")
-    try:
-        for step, args in (
-            ("--init", ["--init"]),
-            ("--populate", ["--populate-from", str(keyrings), "--populate", "archlinux", "omarchy"]),
-        ):
-            res = subprocess.run(
-                ["pacman-key", "--gpgdir", str(gpgdir), *args],
-                capture_output=True, text=True,
-            )
-            if res.returncode != 0:
-                raise RuntimeError(
-                    f"pacman-key {step} failed (exit {res.returncode}):\n"
-                    f"{(res.stderr or res.stdout).strip()}"
-                )
-    finally:
-        subprocess.run(["gpgconf", "--homedir", str(gpgdir), "--kill", "all"],
-                       check=False, capture_output=True)
+    gpgdir = shlex.quote(str(ctx.target / "etc" / "pacman.d" / "gnupg"))
+    keyrings = shlex.quote(str(ctx.target / "usr" / "share" / "pacman" / "keyrings"))
+    script = (
+        f"pacman-key --gpgdir {gpgdir} --init && "
+        f"pacman-key --gpgdir {gpgdir} --populate-from {keyrings} --populate archlinux omarchy"
+    )
+    info("› initializing per-machine pacman keyring (background unit)")
+    # A failed unit from an earlier attempt would hold the name (--collect
+    # releases it, but not for a unit started without it).
+    subprocess.run(["systemctl", "reset-failed", TARGET_KEYRING_UNIT], check=False, capture_output=True)
+    ctx.state["target_keyring_proc"] = subprocess.Popen(
+        ["systemd-run", "--wait", "--pipe", "--collect", "--quiet",
+         f"--unit={TARGET_KEYRING_UNIT}", "sh", "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+
+def _join_target_keyring_init(ctx: InstallContext, *, raise_on_error: bool = True) -> None:
+    """Wait for the keyring unit if one is running; no-op otherwise."""
+    proc = ctx.state.pop("target_keyring_proc", None)
+    if proc is None:
+        return
+    out, _ = proc.communicate()
+    if raise_on_error and proc.returncode != 0:
+        raise RuntimeError(
+            f"per-machine pacman keyring init failed (exit {proc.returncode}):\n"
+            f"{(out or '').strip()}"
+        )
+
+
+def stop_target_keyring_init(ctx: InstallContext) -> None:
+    """Exit path: end the keyring unit if it is still running, so nothing
+    keeps writing into the target after the install has stopped. The
+    install's own error must win, so a keyring failure is not raised here."""
+    if ctx.state.get("target_keyring_proc") is None:
+        return
+    subprocess.run(["systemctl", "stop", TARGET_KEYRING_UNIT], check=False, capture_output=True)
+    _join_target_keyring_init(ctx, raise_on_error=False)
 
 
 def _umount_tree(root: Path, attempts: int = 20) -> None:
@@ -2050,6 +2087,9 @@ def _validate_pre_mounted_filesystems(ctx: InstallContext) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def create_factory_snapshot(ctx: InstallContext) -> None:
+    # The keyring unit writes into @; the snapshot must not catch it midway.
+    _join_target_keyring_init(ctx)
+
     fstype = _findmnt_value(ctx.target, "FSTYPE")
     if fstype != "btrfs":
         info(f"› target root is {fstype or 'unknown'}, not btrfs; skipping factory snapshot")
