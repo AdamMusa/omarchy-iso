@@ -70,16 +70,23 @@ fi
 # Set OMARCHY_NO_PREFETCH=1 to A/B the same ISO with this disabled.
 warm_offline_mirror() {
   local mirror=/var/cache/omarchy/mirror/offline
-  local image budget_kb spent_kb=0 size_kb path
-  # Same candidates, same order, as the orchestrator's ROOT_IMAGE_STREAM_CANDIDATES.
-  for image in /run/archiso/bootmnt/arch/x86_64/omarchy-root.btrfs /var/cache/omarchy/rootfs/omarchy-root.btrfs; do
-    [[ -f $image ]] && break
-  done
+  local budget_kb spent_kb=0 size_kb path
+  # The orchestrator's ROOT_IMAGE_STREAM.
+  local image=/run/archiso/bootmnt/arch/x86_64/omarchy-root.btrfs
 
   [[ ${OMARCHY_NO_PREFETCH:-} == 1 ]] && return 0
 
   budget_kb=$(($(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo) / 2))
   ((budget_kb > 262144)) || return 0
+
+  # omarchy-root-image-verify.service (started at boot) reads the whole image
+  # front to back as it hashes it, and two readers on one USB stick seek
+  # against each other: let it finish first. Its pass is the warm-up for the
+  # image too; the head read below is then a cache hit where the image fit,
+  # and re-warms the front where a small budget made the kernel drop it.
+  while [[ $(systemctl is-active omarchy-root-image-verify.service 2>/dev/null) == activating ]]; do
+    sleep 1
+  done
 
   # The image first, and only as much of it as fits: btrfs receive reads it
   # front to back, so the leading bytes are the ones worth having cached.

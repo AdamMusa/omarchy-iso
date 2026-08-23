@@ -1,12 +1,12 @@
 """Unit tests for the root image install path in the orchestrator.
 
 Covers the pre-flight checks prepare_install_target runs before the disk is
-touched (stream present and matching its checksum, a disk layout the image
-can land on) and the destructive subvolume dance in _install_root_image,
+touched (stream present and verified by the boot-time unit, a disk layout
+the image can land on) and the destructive subvolume dance in _install_root_image,
 asserted on the subprocess calls against a temp target.
 """
 
-import hashlib
+import os
 import shutil
 import sys
 import tempfile
@@ -78,6 +78,16 @@ class VerifyRootImageLayoutTest(unittest.TestCase):
 
 
 class VerifyRootImageStreamTest(unittest.TestCase):
+    """The boot-time verify unit is the only hasher: this collects its
+    verdict, waits for it when it is still running, starts it when it never
+    ran, and fails the install when it cannot vouch for the stream."""
+
+    UNIT = phases_impl.ROOT_IMAGE_VERIFY_UNIT
+    ACTIVE = {"LoadState": "loaded", "ActiveState": "active", "MainPID": "0"}
+    FAILED = {"LoadState": "loaded", "ActiveState": "failed", "MainPID": "0"}
+    RUNNING = {"LoadState": "loaded", "ActiveState": "activating", "MainPID": "4242"}
+    IDLE = {"LoadState": "loaded", "ActiveState": "inactive", "MainPID": "0"}
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -85,64 +95,105 @@ class VerifyRootImageStreamTest(unittest.TestCase):
         self.stream = self.dir / "omarchy-root.btrfs"
         self.checksum = self.dir / "omarchy-root.btrfs.sha256"
         self.ctx = types.SimpleNamespace(state_dir=self.dir / "state")
+        self.runs = []
+        self.progress = []
 
-        patch = mock.patch.object(phases_impl, "ROOT_IMAGE_STREAM_CANDIDATES", (self.stream,))
-        patch.start()
-        self.addCleanup(patch.stop)
-        for name in ("info", "_write_phase_progress"):
-            patch = mock.patch.object(phases_impl, name)
+        def fake_run(cmd, **kwargs):
+            self.runs.append(cmd)
+            return CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        for patch in (
+            mock.patch.object(phases_impl, "ROOT_IMAGE_STREAM", self.stream),
+            mock.patch.object(phases_impl, "ROOT_IMAGE_CHECKSUM", self.checksum),
+            mock.patch.object(phases_impl, "info"),
+            mock.patch.object(phases_impl, "_write_phase_progress",
+                              side_effect=lambda ctx, f: self.progress.append(f)),
+            mock.patch.object(phases_impl.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(phases_impl.time, "sleep"),
+            mock.patch.object(phases_impl, "_journal_tail",
+                              return_value="\nsha256sum: WARNING: 1 computed checksum did NOT match"),
+        ):
             patch.start()
             self.addCleanup(patch.stop)
 
-    def write_stream(self, data=b"btrfs-stream" * 1000):
-        self.stream.write_bytes(data)
-        self.checksum.write_text(f"{hashlib.sha256(data).hexdigest()}  {self.stream.name}\n")
+    def write_stream(self):
+        # Contents are irrelevant: the orchestrator never hashes, the unit does.
+        self.stream.write_bytes(b"btrfs-stream" * 1000)
+        self.checksum.write_text(f"{'0' * 64}  {self.stream.name}\n")
 
-    def test_matching_checksum_passes(self):
+    def states(self, *seq):
+        it = iter(seq)
+        last = seq[-1]
+        return mock.patch.object(phases_impl, "_systemctl_show", side_effect=lambda unit: next(it, last))
+
+    def test_unit_already_succeeded(self):
         self.write_stream()
-        phases_impl.verify_root_image_stream(self.ctx)
+        with self.states(self.ACTIVE):
+            phases_impl.verify_root_image_stream(self.ctx)
+        self.assertEqual(self.runs, [])
+
+    def test_unit_failure_is_a_corrupt_medium(self):
+        self.write_stream()
+        with self.states(self.FAILED):
+            with self.assertRaisesRegex(RuntimeError, r"(?s)corrupt.*re-flash.*did NOT match"):
+                phases_impl.verify_root_image_stream(self.ctx)
+
+    def test_waits_for_a_running_unit_and_reports_its_progress(self):
+        self.write_stream()
+        total = self.stream.stat().st_size
+        reads = iter([total // 4, total // 2])
+        with self.states(self.RUNNING, self.RUNNING, self.ACTIVE), \
+                mock.patch.object(phases_impl, "_process_read_bytes", side_effect=lambda pid: next(reads)), \
+                mock.patch.object(phases_impl.time, "monotonic", side_effect=[1.0, 2.0]):
+            phases_impl.verify_root_image_stream(self.ctx)
+        self.assertEqual(self.progress, [0.25, 0.5])
+        self.assertEqual(self.runs, [])
+
+    def test_unit_not_started_is_started_and_waited_for(self):
+        self.write_stream()
+        with self.states(self.IDLE, self.ACTIVE):
+            phases_impl.verify_root_image_stream(self.ctx)
+        self.assertEqual(self.runs, [["systemctl", "start", self.UNIT]])
+
+    def test_unit_that_will_not_run_fails_the_install(self):
+        self.write_stream()
+        with self.states(self.IDLE, self.IDLE):
+            with self.assertRaisesRegex(RuntimeError, "did not run"):
+                phases_impl.verify_root_image_stream(self.ctx)
+        self.assertEqual(self.runs, [["systemctl", "start", self.UNIT]])
+
+    def test_missing_unit_fails_the_install(self):
+        self.write_stream()
+        with self.states({"LoadState": "not-found"}):
+            with self.assertRaisesRegex(RuntimeError, "not on this live system"):
+                phases_impl.verify_root_image_stream(self.ctx)
 
     def test_missing_stream(self):
-        with self.assertRaisesRegex(RuntimeError, "stream missing"):
-            phases_impl.verify_root_image_stream(self.ctx)
+        with self.states(self.ACTIVE):
+            with self.assertRaisesRegex(RuntimeError, "stream missing"):
+                phases_impl.verify_root_image_stream(self.ctx)
 
     def test_missing_checksum(self):
         self.stream.write_bytes(b"x")
-        with self.assertRaisesRegex(RuntimeError, "checksum missing"):
-            phases_impl.verify_root_image_stream(self.ctx)
+        with self.states(self.ACTIVE):
+            with self.assertRaisesRegex(RuntimeError, "checksum missing"):
+                phases_impl.verify_root_image_stream(self.ctx)
 
-    def test_unreadable_checksum(self):
-        self.stream.write_bytes(b"x")
-        self.checksum.write_text("not a digest\n")
-        with self.assertRaisesRegex(RuntimeError, "checksum unreadable"):
-            phases_impl.verify_root_image_stream(self.ctx)
+    def test_systemctl_show_parses_properties(self):
+        phases_impl.subprocess.run.side_effect = lambda cmd, **kw: CompletedProcess(
+            cmd, 0, stdout="LoadState=loaded\nActiveState=activating\nMainPID=7\n", stderr="")
+        self.assertEqual(phases_impl._systemctl_show("x.service"),
+                         {"LoadState": "loaded", "ActiveState": "activating", "MainPID": "7"})
 
-    def test_truncated_stream_rejected(self):
-        self.write_stream()
-        data = self.stream.read_bytes()
-        self.stream.write_bytes(data[: len(data) // 2])
-        with self.assertRaisesRegex(RuntimeError, "corrupt"):
-            phases_impl.verify_root_image_stream(self.ctx)
+    def test_systemctl_missing_means_no_unit(self):
+        phases_impl.subprocess.run.side_effect = FileNotFoundError("systemctl")
+        self.assertEqual(phases_impl._systemctl_show("x.service"), {})
 
-
-class RootImageStreamLookupTest(unittest.TestCase):
-    def test_first_existing_candidate_wins(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            iso = Path(tmp) / "bootmnt/omarchy-root.btrfs"
-            sfs = Path(tmp) / "rootfs/omarchy-root.btrfs"
-            sfs.parent.mkdir()
-            sfs.write_bytes(b"old")
-            with mock.patch.object(phases_impl, "ROOT_IMAGE_STREAM_CANDIDATES", (iso, sfs)):
-                self.assertEqual(phases_impl._root_image_stream(), sfs)
-                iso.parent.mkdir()
-                iso.write_bytes(b"new")
-                self.assertEqual(phases_impl._root_image_stream(), iso)
-
-    def test_no_candidate_lists_every_path(self):
-        with mock.patch.object(phases_impl, "ROOT_IMAGE_STREAM_CANDIDATES",
-                               (Path("/nonexistent/a"), Path("/nonexistent/b"))):
-            with self.assertRaisesRegex(RuntimeError, "stream missing.*/nonexistent/a.*/nonexistent/b"):
-                phases_impl._root_image_stream()
+    def test_process_read_bytes(self):
+        self.assertIsNone(phases_impl._process_read_bytes("0"))
+        self.assertIsNone(phases_impl._process_read_bytes(None))
+        self.assertIsNone(phases_impl._process_read_bytes("99999999"))
+        self.assertIsInstance(phases_impl._process_read_bytes(str(os.getpid())), int)
 
 
 class PrepareInstallTargetTest(unittest.TestCase):
@@ -239,7 +290,7 @@ class InstallRootImageTest(unittest.TestCase):
                               return_value=["limine", "omarchy-keyring", "omarchy"]),
             mock.patch.object(phases_impl.arch, "target_has_package", create=True,
                               side_effect=lambda target, pkg: pkg in self.received_packages),
-            mock.patch.object(phases_impl, "ROOT_IMAGE_STREAM_CANDIDATES", (self.stream,)),
+            mock.patch.object(phases_impl, "ROOT_IMAGE_STREAM", self.stream),
             mock.patch.object(phases_impl, "info"),
         ]
         for patch in patches:

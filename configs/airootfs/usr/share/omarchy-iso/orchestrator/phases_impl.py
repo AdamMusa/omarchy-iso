@@ -128,25 +128,21 @@ def _omarchy_nvim_package() -> str:
 # The root image: a `btrfs send --compressed-data` stream of the invariant
 # target system (build-root-image.sh), unpacked onto the target in place of
 # pacstrapping it. build-iso.sh ships it as a plain file on the ISO, read
-# straight off the boot medium; the squashfs location is where builds before
-# that move put it, kept so an older live root and a newer orchestrator (or
-# the reverse) still find the stream. The subvolume name is what
-# build-root-image.sh sends.
-ROOT_IMAGE_STREAM_CANDIDATES = (
-    Path("/run/archiso/bootmnt/arch/x86_64/omarchy-root.btrfs"),
-    Path("/var/cache/omarchy/rootfs/omarchy-root.btrfs"),
-)
-# build-iso.sh writes sha256sum output for the stream next to it.
-ROOT_IMAGE_CHECKSUM_SUFFIX = ".sha256"
+# straight off the boot medium, with sha256sum output for it next to it. The
+# subvolume name is what build-root-image.sh sends.
+ROOT_IMAGE_STREAM = Path("/run/archiso/bootmnt/arch/x86_64/omarchy-root.btrfs")
+ROOT_IMAGE_CHECKSUM = ROOT_IMAGE_STREAM.with_name(ROOT_IMAGE_STREAM.name + ".sha256")
+# The live ISO starts this oneshot at boot: `sha256sum -c` of the stream,
+# running while the user is in the configurator. It is the only verifier;
+# verify_root_image_stream collects its verdict.
+ROOT_IMAGE_VERIFY_UNIT = "omarchy-root-image-verify.service"
 ROOT_IMAGE_SUBVOLUME = "omarchy-root"
 
 
 def _root_image_stream() -> Path:
-    for candidate in ROOT_IMAGE_STREAM_CANDIDATES:
-        if candidate.is_file():
-            return candidate
-    searched = ", ".join(str(c) for c in ROOT_IMAGE_STREAM_CANDIDATES)
-    raise RuntimeError(f"root image stream missing; looked at {searched}")
+    if not ROOT_IMAGE_STREAM.is_file():
+        raise RuntimeError(f"root image stream missing: {ROOT_IMAGE_STREAM}")
+    return ROOT_IMAGE_STREAM
 
 # Packages the image must carry for the rest of the install to work: Limine
 # setup reads the settings package's limine config, useradd copies the skel the
@@ -256,38 +252,99 @@ def verify_root_image_stream(ctx: InstallContext) -> None:
     """The stream is present and hashes to what the build recorded. A
     truncated or corrupt copy (a badly flashed USB is the common case) would
     also trip btrfs receive's per-command checksums, but only after the disk
-    is formatted. Reading the whole stream here also leaves as much of it as
-    fits in the page cache for the unpack that follows."""
+    is formatted.
+
+    The hash is ROOT_IMAGE_VERIFY_UNIT's job: it starts at boot and reads
+    the stream while the user is in the configurator, so by now it is
+    usually long done and this only collects the verdict. If it is still
+    running, wait for it; if it never started, start it and wait. The read
+    also leaves as much of the stream as fits in the page cache for the
+    unpack that follows."""
     stream_path = _root_image_stream()
-    checksum = stream_path.with_name(stream_path.name + ROOT_IMAGE_CHECKSUM_SUFFIX)
-    if not checksum.is_file():
-        raise RuntimeError(f"root image checksum missing: {checksum}")
-
-    # sha256sum output: "<hex>  <filename>".
-    fields = checksum.read_text().split()
-    expected = fields[0].lower() if fields else ""
-    if not re.fullmatch(r"[0-9a-f]{64}", expected):
-        raise RuntimeError(f"root image checksum unreadable: {checksum}")
-
+    if not ROOT_IMAGE_CHECKSUM.is_file():
+        raise RuntimeError(f"root image checksum missing: {ROOT_IMAGE_CHECKSUM}")
     total = stream_path.stat().st_size
-    info(f"› verifying root image ({total >> 20} MiB stream at {stream_path})")
-    digest = hashlib.sha256()
-    done = 0
+
+    state = _systemctl_show(ROOT_IMAGE_VERIFY_UNIT)
+    if state.get("LoadState") != "loaded":
+        raise RuntimeError(f"{ROOT_IMAGE_VERIFY_UNIT} is not on this live system; cannot verify the root image")
+    if state.get("ActiveState") == "inactive":
+        # Not started yet. Blocks until the oneshot exits.
+        subprocess.run(["systemctl", "start", ROOT_IMAGE_VERIFY_UNIT], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        state = _systemctl_show(ROOT_IMAGE_VERIFY_UNIT)
+
+    reported = False
     last_report = 0.0
-    with stream_path.open("rb") as stream:
-        while chunk := stream.read(8 << 20):
-            digest.update(chunk)
-            done += len(chunk)
-            now = time.monotonic()
-            if now - last_report >= 0.5:
+    while True:
+        active = state.get("ActiveState")
+        if active == "active":
+            info(f"› root image verified by {ROOT_IMAGE_VERIFY_UNIT} ({total >> 20} MiB stream at {stream_path})")
+            return
+        if active == "failed":
+            raise RuntimeError(
+                f"root image stream is corrupt: {ROOT_IMAGE_VERIFY_UNIT} failed "
+                f"({stream_path}, {total} bytes); re-flash the install medium"
+                + _journal_tail(ROOT_IMAGE_VERIFY_UNIT)
+            )
+        if active != "activating":
+            raise RuntimeError(
+                f"{ROOT_IMAGE_VERIFY_UNIT} did not run (state {active!r}); cannot verify the root image"
+                + _journal_tail(ROOT_IMAGE_VERIFY_UNIT)
+            )
+
+        if not reported:
+            info(f"› waiting for {ROOT_IMAGE_VERIFY_UNIT} ({total >> 20} MiB stream at {stream_path})")
+            reported = True
+        now = time.monotonic()
+        if now - last_report >= 0.5:
+            done = _process_read_bytes(state.get("MainPID"))
+            if done is not None:
                 _write_phase_progress(ctx, done / total if total else 1.0)
-                last_report = now
-    actual = digest.hexdigest()
-    if actual != expected:
-        raise RuntimeError(
-            f"root image stream is corrupt: sha256 {actual} != {expected} "
-            f"({stream_path}, {total} bytes); re-flash the install medium"
+            last_report = now
+        time.sleep(0.25)
+        state = _systemctl_show(ROOT_IMAGE_VERIFY_UNIT)
+
+
+def _systemctl_show(unit: str) -> dict[str, str]:
+    """`systemctl show` of the properties the verify handoff reads, as a
+    dict. Empty when systemctl is unavailable (unit tests off the ISO)."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "show", "-p", "LoadState,ActiveState,MainPID", unit],
+            capture_output=True, text=True, check=False,
         )
+    except OSError:
+        return {}
+    if result.returncode != 0:
+        return {}
+    return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+
+
+def _process_read_bytes(pid: str | None) -> int | None:
+    """Bytes the process has read so far (rchar from /proc/PID/io): the
+    progress of a sequential hash. None when unknown."""
+    if not pid or pid == "0":
+        return None
+    try:
+        for line in Path(f"/proc/{pid}/io").read_text().splitlines():
+            if line.startswith("rchar:"):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _journal_tail(unit: str) -> str:
+    try:
+        result = subprocess.run(
+            ["journalctl", "-b", "-u", unit, "--no-pager", "-o", "cat", "-n", "5"],
+            capture_output=True, text=True, check=False,
+        )
+    except OSError:
+        return ""
+    output = result.stdout.strip()
+    return f"\n{output}" if output else ""
 
 
 def arch_install_system(ctx: InstallContext) -> None:
