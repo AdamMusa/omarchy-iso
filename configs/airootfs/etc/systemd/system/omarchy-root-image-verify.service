@@ -14,6 +14,9 @@ ConditionPathExists=/run/archiso/bootmnt/arch/x86_64/omarchy-root.btrfs.sha256
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/run/archiso/bootmnt/arch/x86_64
+# Logs the boot device and its I/O scheduler next to the verify result;
+# the idle class below only takes effect under bfq.
+ExecStartPre=/usr/local/bin/omarchy-iso-boot-medium
 ExecStart=/usr/bin/sha256sum --check --strict omarchy-root.btrfs.sha256
 # Background work: never compete with the console or anything interactive.
 Nice=19
