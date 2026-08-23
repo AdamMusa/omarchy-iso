@@ -1,0 +1,80 @@
+#!/bin/bash
+# Single source of truth for validating the root image on the install medium
+# before anything formats a disk.
+#
+# The root image is streamed from the boot medium (copytoram is off), so a bad
+# medium must be caught before the full-disk orchestrator hands off to
+# archinstall *and* before the free-space configurator partitions the target.
+# omarchy-root-image-verify.service hashes the image in the background from boot
+# (idle-class, so it yields to the live system under the boot-medium BFQ rule);
+# this collects that verdict, waiting for the hash if it is still running and
+# starting it if it never did.
+#
+# Also logs the boot device and its I/O scheduler to stdout (the idle class only
+# takes effect under bfq) -- this folds in what used to be omarchy-iso-boot-medium.
+#
+# Exit 0: image verified (device/scheduler line on stdout). Non-zero: corrupt,
+# missing, or unverifiable -- the message is on stderr with the first line
+# written to headline the install dashboard.
+set -uo pipefail
+
+UNIT=omarchy-root-image-verify.service
+BOOT_MEDIUM_MOUNT=/run/archiso/bootmnt
+STREAM="$BOOT_MEDIUM_MOUNT/arch/x86_64/omarchy-root.btrfs"
+CHECKSUM="$STREAM.sha256"
+
+fail() { echo "$1" >&2; exit 1; }
+
+# --- boot medium + scheduler (absorbed from omarchy-iso-boot-medium) ---
+src=$(findmnt -no SOURCE "$BOOT_MEDIUM_MOUNT" 2>/dev/null || true)
+if [[ -n $src ]]; then
+  disk=$(lsblk -no PKNAME "$src" 2>/dev/null | head -n1)
+  disk=${disk:-${src#/dev/}}
+  sched=unknown
+  [[ -r /sys/block/$disk/queue/scheduler ]] && sched=$(cat "/sys/block/$disk/queue/scheduler")
+  echo "boot medium: $src on /dev/$disk, scheduler: $sched"
+fi
+
+if [[ ! -f $STREAM ]]; then
+  # The archiso hook unmounts the boot medium after copying the airootfs to RAM
+  # (copytoram). The boot entries pin copytoram=n, so this only happens when
+  # someone edits the kernel command line.
+  [[ -d $BOOT_MEDIUM_MOUNT ]] || fail "boot medium is not mounted at $BOOT_MEDIUM_MOUNT: the live system was copied to RAM (copytoram) and the medium released; boot with copytoram=n"
+  fail "root image stream missing: $STREAM"
+fi
+[[ -f $CHECKSUM ]] || fail "root image checksum missing: $CHECKSUM"
+
+[[ "$(systemctl show "$UNIT" -p LoadState --value 2>/dev/null)" == loaded ]] ||
+  fail "$UNIT is not on this live system; cannot verify the root image"
+
+# inactive -> never started; `systemctl start` blocks until the oneshot exits.
+[[ "$(systemctl show "$UNIT" -p ActiveState --value 2>/dev/null)" == inactive ]] &&
+  systemctl start "$UNIT" >/dev/null 2>&1
+
+reported=false
+while :; do
+  case "$(systemctl show "$UNIT" -p ActiveState --value 2>/dev/null)" in
+    active)
+      exit 0
+      ;;
+    failed)
+      # The dashboard centres each line in ~80 columns, so the action comes
+      # first and on its own line; the journal tail (the hasher's own output)
+      # follows for debugging.
+      msg="install medium is corrupt: re-flash it"$'\n'"sha256 mismatch on the root image"
+      tail=$(journalctl -b -u "$UNIT" _COMM=sha256sum --no-pager -o cat 2>/dev/null)
+      [[ -n $tail ]] && msg+=$'\n'"$tail"
+      fail "$msg"
+      ;;
+    activating)
+      if [[ $reported == false ]]; then
+        echo "waiting for $UNIT to finish hashing the root image..."
+        reported=true
+      fi
+      sleep 0.5
+      ;;
+    *)
+      fail "$UNIT did not run; cannot verify the root image"
+      ;;
+  esac
+done

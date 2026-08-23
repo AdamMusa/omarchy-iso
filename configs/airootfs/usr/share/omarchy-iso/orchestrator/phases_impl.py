@@ -131,12 +131,13 @@ def _omarchy_nvim_package() -> str:
 # straight off the boot medium, with sha256sum output for it next to it. The
 # subvolume name is what build-root-image.sh sends.
 ROOT_IMAGE_STREAM = Path("/run/archiso/bootmnt/arch/x86_64/omarchy-root.btrfs")
-ROOT_IMAGE_CHECKSUM = ROOT_IMAGE_STREAM.with_name(ROOT_IMAGE_STREAM.name + ".sha256")
-# The live ISO starts this oneshot at boot: `sha256sum -c` of the stream,
-# running while the user is in the configurator. It is the only verifier;
-# verify_root_image_stream collects its verdict.
-ROOT_IMAGE_VERIFY_UNIT = "omarchy-root-image-verify.service"
 ROOT_IMAGE_SUBVOLUME = "omarchy-root"
+# The live ISO starts omarchy-root-image-verify.service at boot: `sha256sum -c`
+# of the stream, running while the user is in the configurator. It is the only
+# verifier. Both this phase and the free-space configurator gate collect its
+# verdict through this helper, which logs the boot medium and its I/O scheduler,
+# waits for the unit if it is still hashing, and starts it if it never ran.
+ROOT_IMAGE_VERIFY_HELPER = "/usr/local/bin/omarchy-wait-root-image-verify"
 
 
 BOOT_MEDIUM_MOUNT = Path("/run/archiso/bootmnt")
@@ -265,103 +266,30 @@ def verify_root_image_stream(ctx: InstallContext) -> None:
     also trip btrfs receive's per-command checksums, but only after the disk
     is formatted.
 
-    The hash is ROOT_IMAGE_VERIFY_UNIT's job: it starts at boot and reads
-    the stream while the user is in the configurator, so by now it is
-    usually long done and this only collects the verdict. If it is still
-    running, wait for it; if it never started, start it and wait. The read
-    also leaves as much of the stream as fits in the page cache for the
-    unpack that follows."""
-    stream_path = _root_image_stream()
-    if not ROOT_IMAGE_CHECKSUM.is_file():
-        raise RuntimeError(f"root image checksum missing: {ROOT_IMAGE_CHECKSUM}")
-    total = stream_path.stat().st_size
-
-    state = _systemctl_show(ROOT_IMAGE_VERIFY_UNIT)
-    if state.get("LoadState") != "loaded":
-        raise RuntimeError(f"{ROOT_IMAGE_VERIFY_UNIT} is not on this live system; cannot verify the root image")
-    if state.get("ActiveState") == "inactive":
-        # Not started yet. Blocks until the oneshot exits.
-        subprocess.run(["systemctl", "start", ROOT_IMAGE_VERIFY_UNIT], check=False,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        state = _systemctl_show(ROOT_IMAGE_VERIFY_UNIT)
-
-    reported = False
-    last_report = 0.0
-    while True:
-        active = state.get("ActiveState")
-        if active == "active":
-            info(f"› root image verified by {ROOT_IMAGE_VERIFY_UNIT} ({total >> 20} MiB stream at {stream_path})")
-            return
-        if active == "failed":
-            # The dashboard centres each line of this in ~80 columns, so the
-            # action comes first and on its own line; the detail follows.
-            raise RuntimeError(
-                "install medium is corrupt: re-flash it\n"
-                f"sha256 mismatch on {stream_path.name} ({total} bytes, {ROOT_IMAGE_VERIFY_UNIT})"
-                + _journal_tail(ROOT_IMAGE_VERIFY_UNIT, comm="sha256sum")
-            )
-        if active != "activating":
-            raise RuntimeError(
-                f"{ROOT_IMAGE_VERIFY_UNIT} did not run (state {active!r}); cannot verify the root image"
-                + _journal_tail(ROOT_IMAGE_VERIFY_UNIT)
-            )
-
-        if not reported:
-            info(f"› waiting for {ROOT_IMAGE_VERIFY_UNIT} ({total >> 20} MiB stream at {stream_path})")
-            reported = True
-        now = time.monotonic()
-        if now - last_report >= 0.5:
-            done = _process_read_bytes(state.get("MainPID"))
-            if done is not None:
-                _write_phase_progress(ctx, done / total if total else 1.0)
-            last_report = now
-        time.sleep(0.25)
-        state = _systemctl_show(ROOT_IMAGE_VERIFY_UNIT)
-
-
-def _systemctl_show(unit: str) -> dict[str, str]:
-    """`systemctl show` of the properties the verify handoff reads, as a
-    dict. Empty when systemctl is unavailable (unit tests off the ISO)."""
+    ROOT_IMAGE_VERIFY_HELPER is the single source of truth: it collects the
+    boot-time hasher's verdict, waiting for the unit if it is still running
+    and starting it if it never did, and logs the boot medium and its I/O
+    scheduler. The free-space configurator gate runs the same helper before it
+    partitions, so both disk-touching paths clear the same check; whoever gets
+    there first pays the wait. The hasher's read also leaves as much of the
+    stream as fits in the page cache for the unpack that follows."""
     try:
         result = subprocess.run(
-            ["systemctl", "show", "-p", "LoadState,ActiveState,MainPID", unit],
+            [ROOT_IMAGE_VERIFY_HELPER],
             capture_output=True, text=True, check=False,
         )
-    except OSError:
-        return {}
+    except OSError as exc:
+        raise RuntimeError(f"could not run {ROOT_IMAGE_VERIFY_HELPER}: {exc}") from exc
+
+    for line in result.stdout.splitlines():
+        if line.strip():
+            info(f"› {line.strip()}")
+
     if result.returncode != 0:
-        return {}
-    return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
-
-
-def _process_read_bytes(pid: str | None) -> int | None:
-    """Bytes the process has read so far (rchar from /proc/PID/io): the
-    progress of a sequential hash. None when unknown."""
-    if not pid or pid == "0":
-        return None
-    try:
-        for line in Path(f"/proc/{pid}/io").read_text().splitlines():
-            if line.startswith("rchar:"):
-                return int(line.split()[1])
-    except (OSError, ValueError, IndexError):
-        pass
-    return None
-
-
-def _journal_tail(unit: str, comm: str | None = None) -> str:
-    """This boot's journal for the unit, one line per entry, prefixed with a
-    newline for appending to an error. With comm, only what that program
-    wrote: the unit's own verdict without systemd's exit/failed/consumed
-    boilerplate around it."""
-    cmd = ["journalctl", "-b", "-u", unit, "--no-pager", "-o", "cat", "-n", "5"]
-    if comm:
-        cmd = ["journalctl", "-b", "-u", unit, f"_COMM={comm}", "--no-pager", "-o", "cat"]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    except OSError:
-        return ""
-    output = result.stdout.strip()
-    return f"\n{output}" if output else ""
+        raise RuntimeError(
+            result.stderr.strip()
+            or f"{ROOT_IMAGE_VERIFY_HELPER} failed with status {result.returncode}"
+        )
 
 
 def arch_install_system(ctx: InstallContext) -> None:

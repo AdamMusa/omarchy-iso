@@ -6,7 +6,6 @@ the image can land on) and the destructive subvolume dance in _install_root_imag
 asserted on the subprocess calls against a temp target.
 """
 
-import os
 import shutil
 import sys
 import tempfile
@@ -78,160 +77,59 @@ class VerifyRootImageLayoutTest(unittest.TestCase):
 
 
 class VerifyRootImageStreamTest(unittest.TestCase):
-    """The boot-time verify unit is the only hasher: this collects its
-    verdict, waits for it when it is still running, starts it when it never
-    ran, and fails the install when it cannot vouch for the stream."""
+    """verify_root_image_stream delegates to the shared shell helper
+    (omarchy-wait-root-image-verify): it passes when the helper exits 0 and
+    fails the install with the helper's message when it does not. The wait,
+    the systemd handoff and the corrupt-medium wording live in the helper and
+    are covered by test/unit/wait-root-image-verify-test.sh."""
 
-    UNIT = phases_impl.ROOT_IMAGE_VERIFY_UNIT
-    ACTIVE = {"LoadState": "loaded", "ActiveState": "active", "MainPID": "0"}
-    FAILED = {"LoadState": "loaded", "ActiveState": "failed", "MainPID": "0"}
-    RUNNING = {"LoadState": "loaded", "ActiveState": "activating", "MainPID": "4242"}
-    IDLE = {"LoadState": "loaded", "ActiveState": "inactive", "MainPID": "0"}
+    HELPER = phases_impl.ROOT_IMAGE_VERIFY_HELPER
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.dir = Path(self.tmp.name)
-        self.stream = self.dir / "omarchy-root.btrfs"
-        self.checksum = self.dir / "omarchy-root.btrfs.sha256"
-        self.ctx = types.SimpleNamespace(state_dir=self.dir / "state")
-        self.runs = []
-        self.progress = []
-        self.real_journal_tail = phases_impl._journal_tail
+        self.ctx = types.SimpleNamespace(state_dir=Path("/nonexistent"))
+        self.infos = []
+        patch = mock.patch.object(phases_impl, "info", side_effect=self.infos.append)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def helper_returns(self, returncode=0, stdout="", stderr=""):
+        self.captured = {}
 
         def fake_run(cmd, **kwargs):
-            self.runs.append(cmd)
-            return CompletedProcess(cmd, 0, stdout="", stderr="")
+            self.captured["cmd"] = cmd
+            return CompletedProcess(cmd, returncode, stdout=stdout, stderr=stderr)
 
-        for patch in (
-            mock.patch.object(phases_impl, "ROOT_IMAGE_STREAM", self.stream),
-            mock.patch.object(phases_impl, "ROOT_IMAGE_CHECKSUM", self.checksum),
-            mock.patch.object(phases_impl, "BOOT_MEDIUM_MOUNT", self.dir),
-            mock.patch.object(phases_impl, "info"),
-            mock.patch.object(phases_impl, "_write_phase_progress",
-                              side_effect=lambda ctx, f: self.progress.append(f)),
-            mock.patch.object(phases_impl.subprocess, "run", side_effect=fake_run),
-            mock.patch.object(phases_impl.time, "sleep"),
-            mock.patch.object(phases_impl, "_journal_tail",
-                              return_value="\nsha256sum: WARNING: 1 computed checksum did NOT match"),
-        ):
-            patch.start()
-            self.addCleanup(patch.stop)
+        return mock.patch.object(phases_impl.subprocess, "run", side_effect=fake_run)
 
-    def write_stream(self):
-        # Contents are irrelevant: the orchestrator never hashes, the unit does.
-        self.stream.write_bytes(b"btrfs-stream" * 1000)
-        self.checksum.write_text(f"{'0' * 64}  {self.stream.name}\n")
-
-    def states(self, *seq):
-        it = iter(seq)
-        last = seq[-1]
-        return mock.patch.object(phases_impl, "_systemctl_show", side_effect=lambda unit: next(it, last))
-
-    def test_unit_already_succeeded(self):
-        self.write_stream()
-        with self.states(self.ACTIVE):
+    def test_passes_when_helper_exits_zero(self):
+        with self.helper_returns(0, stdout="boot medium: /dev/sda1 on /dev/sda, scheduler: none mq-deadline kyber [bfq]\n"):
             phases_impl.verify_root_image_stream(self.ctx)
-        self.assertEqual(self.runs, [])
+        self.assertEqual(self.captured["cmd"], [self.HELPER])
+        # The boot medium / scheduler line the helper prints reaches the log.
+        self.assertTrue(any("bfq" in m for m in self.infos))
 
-    def test_unit_failure_is_a_corrupt_medium(self):
-        self.write_stream()
-        with self.states(self.FAILED):
+    def test_corrupt_medium_raises_with_the_helpers_message(self):
+        stderr = ("install medium is corrupt: re-flash it\n"
+                  "sha256 mismatch on the root image\n"
+                  "omarchy-root.btrfs: FAILED")
+        with self.helper_returns(1, stdout="boot medium: /dev/sda1 ...\n", stderr=stderr):
             with self.assertRaises(RuntimeError) as raised:
                 phases_impl.verify_root_image_stream(self.ctx)
-        lines = str(raised.exception).splitlines()
-        # The dashboard centres each line in ~80 columns: the action first,
-        # short enough to survive, then the detail, then sha256sum's verdict.
-        self.assertEqual(lines[0], "install medium is corrupt: re-flash it")
-        self.assertLess(len(lines[0]), 50)
-        self.assertRegex(lines[1], r"sha256 mismatch on omarchy-root\.btrfs \(\d+ bytes, omarchy-root-image-verify\.service\)")
-        self.assertEqual(lines[2], "sha256sum: WARNING: 1 computed checksum did NOT match")
-        phases_impl._journal_tail.assert_called_once_with(self.UNIT, comm="sha256sum")
+        # The dashboard headlines the first line, so it must lead and be short.
+        first = str(raised.exception).splitlines()[0]
+        self.assertEqual(first, "install medium is corrupt: re-flash it")
+        self.assertLess(len(first), 50)
 
-    def test_journal_tail_filters_to_the_hasher(self):
-        # setUp patches _journal_tail for the handoff tests; exercise the real one.
-        real = self.real_journal_tail
-        def journal(cmd, **kw):
-            self.runs.append(cmd)
-            return CompletedProcess(
-                cmd, 0, stdout="omarchy-root.btrfs: FAILED\nsha256sum: WARNING: 1 computed checksum did NOT match\n", stderr="")
-        phases_impl.subprocess.run.side_effect = journal
-        self.assertEqual(
-            real(self.UNIT, comm="sha256sum"),
-            "\nomarchy-root.btrfs: FAILED\nsha256sum: WARNING: 1 computed checksum did NOT match",
-        )
-        self.assertEqual(
-            self.runs[-1],
-            ["journalctl", "-b", "-u", self.UNIT, "_COMM=sha256sum", "--no-pager", "-o", "cat"],
-        )
-        real(self.UNIT)
-        self.assertEqual(self.runs[-1][:5], ["journalctl", "-b", "-u", self.UNIT, "--no-pager"])
-        self.assertNotIn("_COMM=sha256sum", self.runs[-1])
-
-    def test_waits_for_a_running_unit_and_reports_its_progress(self):
-        self.write_stream()
-        total = self.stream.stat().st_size
-        reads = iter([total // 4, total // 2])
-        with self.states(self.RUNNING, self.RUNNING, self.ACTIVE), \
-                mock.patch.object(phases_impl, "_process_read_bytes", side_effect=lambda pid: next(reads)), \
-                mock.patch.object(phases_impl.time, "monotonic", side_effect=[1.0, 2.0]):
-            phases_impl.verify_root_image_stream(self.ctx)
-        self.assertEqual(self.progress, [0.25, 0.5])
-        self.assertEqual(self.runs, [])
-
-    def test_unit_not_started_is_started_and_waited_for(self):
-        self.write_stream()
-        with self.states(self.IDLE, self.ACTIVE):
-            phases_impl.verify_root_image_stream(self.ctx)
-        self.assertEqual(self.runs, [["systemctl", "start", self.UNIT]])
-
-    def test_unit_that_will_not_run_fails_the_install(self):
-        self.write_stream()
-        with self.states(self.IDLE, self.IDLE):
-            with self.assertRaisesRegex(RuntimeError, "did not run"):
-                phases_impl.verify_root_image_stream(self.ctx)
-        self.assertEqual(self.runs, [["systemctl", "start", self.UNIT]])
-
-    def test_missing_unit_fails_the_install(self):
-        self.write_stream()
-        with self.states({"LoadState": "not-found"}):
-            with self.assertRaisesRegex(RuntimeError, "not on this live system"):
+    def test_nonzero_without_stderr_still_fails(self):
+        with self.helper_returns(3, stdout="", stderr=""):
+            with self.assertRaisesRegex(RuntimeError, "status 3"):
                 phases_impl.verify_root_image_stream(self.ctx)
 
-    def test_missing_stream(self):
-        with self.states(self.ACTIVE):
-            with self.assertRaisesRegex(RuntimeError, "stream missing"):
+    def test_missing_helper_fails_the_install(self):
+        with mock.patch.object(phases_impl.subprocess, "run",
+                               side_effect=FileNotFoundError("no helper")):
+            with self.assertRaisesRegex(RuntimeError, "could not run"):
                 phases_impl.verify_root_image_stream(self.ctx)
-
-    def test_boot_medium_released_by_copytoram(self):
-        # What a ThinkPad X200s showed: archiso's copytoram=auto copied the
-        # airootfs to RAM and unmounted the USB stick, so bootmnt was gone.
-        with mock.patch.object(phases_impl, "BOOT_MEDIUM_MOUNT", self.dir / "bootmnt"):
-            with self.states(self.ACTIVE):
-                with self.assertRaisesRegex(RuntimeError, "copytoram"):
-                    phases_impl.verify_root_image_stream(self.ctx)
-
-    def test_missing_checksum(self):
-        self.stream.write_bytes(b"x")
-        with self.states(self.ACTIVE):
-            with self.assertRaisesRegex(RuntimeError, "checksum missing"):
-                phases_impl.verify_root_image_stream(self.ctx)
-
-    def test_systemctl_show_parses_properties(self):
-        phases_impl.subprocess.run.side_effect = lambda cmd, **kw: CompletedProcess(
-            cmd, 0, stdout="LoadState=loaded\nActiveState=activating\nMainPID=7\n", stderr="")
-        self.assertEqual(phases_impl._systemctl_show("x.service"),
-                         {"LoadState": "loaded", "ActiveState": "activating", "MainPID": "7"})
-
-    def test_systemctl_missing_means_no_unit(self):
-        phases_impl.subprocess.run.side_effect = FileNotFoundError("systemctl")
-        self.assertEqual(phases_impl._systemctl_show("x.service"), {})
-
-    def test_process_read_bytes(self):
-        self.assertIsNone(phases_impl._process_read_bytes("0"))
-        self.assertIsNone(phases_impl._process_read_bytes(None))
-        self.assertIsNone(phases_impl._process_read_bytes("99999999"))
-        self.assertIsInstance(phases_impl._process_read_bytes(str(os.getpid())), int)
 
 
 class PrepareInstallTargetTest(unittest.TestCase):
