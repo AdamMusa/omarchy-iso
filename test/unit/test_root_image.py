@@ -106,6 +106,7 @@ class VerifyRootImageStreamTest(unittest.TestCase):
         for patch in (
             mock.patch.object(phases_impl, "ROOT_IMAGE_STREAM", self.stream),
             mock.patch.object(phases_impl, "ROOT_IMAGE_CHECKSUM", self.checksum),
+            mock.patch.object(phases_impl, "BOOT_MEDIUM_MOUNT", self.dir),
             mock.patch.object(phases_impl, "info"),
             mock.patch.object(phases_impl, "_write_phase_progress",
                               side_effect=lambda ctx, f: self.progress.append(f)),
@@ -201,6 +202,14 @@ class VerifyRootImageStreamTest(unittest.TestCase):
         with self.states(self.ACTIVE):
             with self.assertRaisesRegex(RuntimeError, "stream missing"):
                 phases_impl.verify_root_image_stream(self.ctx)
+
+    def test_boot_medium_released_by_copytoram(self):
+        # What a ThinkPad X200s showed: archiso's copytoram=auto copied the
+        # airootfs to RAM and unmounted the USB stick, so bootmnt was gone.
+        with mock.patch.object(phases_impl, "BOOT_MEDIUM_MOUNT", self.dir / "bootmnt"):
+            with self.states(self.ACTIVE):
+                with self.assertRaisesRegex(RuntimeError, "copytoram"):
+                    phases_impl.verify_root_image_stream(self.ctx)
 
     def test_missing_checksum(self):
         self.stream.write_bytes(b"x")

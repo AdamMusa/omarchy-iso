@@ -139,8 +139,19 @@ ROOT_IMAGE_VERIFY_UNIT = "omarchy-root-image-verify.service"
 ROOT_IMAGE_SUBVOLUME = "omarchy-root"
 
 
+BOOT_MEDIUM_MOUNT = Path("/run/archiso/bootmnt")
+
+
 def _root_image_stream() -> Path:
     if not ROOT_IMAGE_STREAM.is_file():
+        # The archiso hook unmounts the boot medium after copying the airootfs
+        # to RAM (copytoram). The boot entries pin copytoram=n, so this only
+        # happens when someone edits the kernel command line.
+        if not BOOT_MEDIUM_MOUNT.is_dir():
+            raise RuntimeError(
+                f"boot medium is not mounted at {BOOT_MEDIUM_MOUNT}: the live system was "
+                "copied to RAM (copytoram) and the medium released; boot with copytoram=n"
+            )
         raise RuntimeError(f"root image stream missing: {ROOT_IMAGE_STREAM}")
     return ROOT_IMAGE_STREAM
 
