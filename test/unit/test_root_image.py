@@ -97,6 +97,7 @@ class VerifyRootImageStreamTest(unittest.TestCase):
         self.ctx = types.SimpleNamespace(state_dir=self.dir / "state")
         self.runs = []
         self.progress = []
+        self.real_journal_tail = phases_impl._journal_tail
 
         def fake_run(cmd, **kwargs):
             self.runs.append(cmd)
@@ -135,8 +136,36 @@ class VerifyRootImageStreamTest(unittest.TestCase):
     def test_unit_failure_is_a_corrupt_medium(self):
         self.write_stream()
         with self.states(self.FAILED):
-            with self.assertRaisesRegex(RuntimeError, r"(?s)corrupt.*re-flash.*did NOT match"):
+            with self.assertRaises(RuntimeError) as raised:
                 phases_impl.verify_root_image_stream(self.ctx)
+        lines = str(raised.exception).splitlines()
+        # The dashboard centres each line in ~80 columns: the action first,
+        # short enough to survive, then the detail, then sha256sum's verdict.
+        self.assertEqual(lines[0], "install medium is corrupt: re-flash it")
+        self.assertLess(len(lines[0]), 50)
+        self.assertRegex(lines[1], r"sha256 mismatch on omarchy-root\.btrfs \(\d+ bytes, omarchy-root-image-verify\.service\)")
+        self.assertEqual(lines[2], "sha256sum: WARNING: 1 computed checksum did NOT match")
+        phases_impl._journal_tail.assert_called_once_with(self.UNIT, comm="sha256sum")
+
+    def test_journal_tail_filters_to_the_hasher(self):
+        # setUp patches _journal_tail for the handoff tests; exercise the real one.
+        real = self.real_journal_tail
+        def journal(cmd, **kw):
+            self.runs.append(cmd)
+            return CompletedProcess(
+                cmd, 0, stdout="omarchy-root.btrfs: FAILED\nsha256sum: WARNING: 1 computed checksum did NOT match\n", stderr="")
+        phases_impl.subprocess.run.side_effect = journal
+        self.assertEqual(
+            real(self.UNIT, comm="sha256sum"),
+            "\nomarchy-root.btrfs: FAILED\nsha256sum: WARNING: 1 computed checksum did NOT match",
+        )
+        self.assertEqual(
+            self.runs[-1],
+            ["journalctl", "-b", "-u", self.UNIT, "_COMM=sha256sum", "--no-pager", "-o", "cat"],
+        )
+        real(self.UNIT)
+        self.assertEqual(self.runs[-1][:5], ["journalctl", "-b", "-u", self.UNIT, "--no-pager"])
+        self.assertNotIn("_COMM=sha256sum", self.runs[-1])
 
     def test_waits_for_a_running_unit_and_reports_its_progress(self):
         self.write_stream()

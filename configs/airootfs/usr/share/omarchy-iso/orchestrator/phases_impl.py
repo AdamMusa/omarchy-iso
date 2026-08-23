@@ -282,10 +282,12 @@ def verify_root_image_stream(ctx: InstallContext) -> None:
             info(f"› root image verified by {ROOT_IMAGE_VERIFY_UNIT} ({total >> 20} MiB stream at {stream_path})")
             return
         if active == "failed":
+            # The dashboard centres each line of this in ~80 columns, so the
+            # action comes first and on its own line; the detail follows.
             raise RuntimeError(
-                f"root image stream is corrupt: {ROOT_IMAGE_VERIFY_UNIT} failed "
-                f"({stream_path}, {total} bytes); re-flash the install medium"
-                + _journal_tail(ROOT_IMAGE_VERIFY_UNIT)
+                "install medium is corrupt: re-flash it\n"
+                f"sha256 mismatch on {stream_path.name} ({total} bytes, {ROOT_IMAGE_VERIFY_UNIT})"
+                + _journal_tail(ROOT_IMAGE_VERIFY_UNIT, comm="sha256sum")
             )
         if active != "activating":
             raise RuntimeError(
@@ -335,12 +337,16 @@ def _process_read_bytes(pid: str | None) -> int | None:
     return None
 
 
-def _journal_tail(unit: str) -> str:
+def _journal_tail(unit: str, comm: str | None = None) -> str:
+    """This boot's journal for the unit, one line per entry, prefixed with a
+    newline for appending to an error. With comm, only what that program
+    wrote: the unit's own verdict without systemd's exit/failed/consumed
+    boilerplate around it."""
+    cmd = ["journalctl", "-b", "-u", unit, "--no-pager", "-o", "cat", "-n", "5"]
+    if comm:
+        cmd = ["journalctl", "-b", "-u", unit, f"_COMM={comm}", "--no-pager", "-o", "cat"]
     try:
-        result = subprocess.run(
-            ["journalctl", "-b", "-u", unit, "--no-pager", "-o", "cat", "-n", "5"],
-            capture_output=True, text=True, check=False,
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     except OSError:
         return ""
     output = result.stdout.strip()

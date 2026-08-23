@@ -353,6 +353,79 @@ EOF
   press ctrl-alt-f1
 }
 
+# Root SSH into the live ISO itself (not the installed system). The live root
+# runs sshd and autologs in on tty1 with an empty password, but sshd refuses
+# empty passwords, so authorize our key the same console-login way as above,
+# on tty3 (tty1 is the installer's).
+ssh_live_root() {
+  ssh -i "$SSH_KEY" -p "$SSH_PORT" \
+    -o BatchMode=yes \
+    -o IdentitiesOnly=yes \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -o ConnectTimeout=5 \
+    -o LogLevel=ERROR \
+    "root@127.0.0.1" "$@"
+}
+
+bootstrap_live_root_ssh() {
+  log "Authorizing root SSH on the live ISO via console login"
+
+  mkdir -p "$BASE_DIR/www"
+  cat >"$BASE_DIR/www/bootstrap-live" <<EOF
+mkdir -p /root/.ssh && chmod 700 /root/.ssh
+echo "$(cat "$SSH_KEY.pub")" >>/root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+EOF
+
+  (cd "$BASE_DIR/www" && exec python3 -m http.server "$HTTP_PORT" --bind 127.0.0.1 >/dev/null 2>&1) &
+  HTTP_PID=$!
+
+  local waited=0
+  while true; do
+    press ctrl-alt-f3
+    sleep 4
+    ocr_screen | grep -qi "login:" && break
+    ((waited += 8))
+
+    if ((waited >= 300)); then
+      capture_console "failure-live-console-timeout"
+      echo "Timed out waiting for a live console login prompt" >&2
+      return 1
+    fi
+    sleep 4
+  done
+
+  type_text root
+  press ret
+  sleep 2
+  # The password is empty; login still prompts for it.
+  ocr_screen | grep -qi "password" && { press ret; sleep 2; }
+
+  type_text "curl -fsS http://10.0.2.2:$HTTP_PORT/bootstrap-live -o /tmp/bs && bash /tmp/bs"
+  press ret
+
+  waited=0
+  until ssh_live_root true 2>/dev/null; do
+    if ! vm_running; then
+      echo "VM exited while waiting for live root SSH" >&2
+      return 1
+    fi
+    if ((waited >= 180)); then
+      capture_console "failure-live-ssh-timeout"
+      echo "Timed out waiting for root SSH on the live ISO" >&2
+      return 1
+    fi
+    sleep 2
+    ((waited += 2))
+  done
+  capture_console "success-live-root-ssh"
+
+  kill "$HTTP_PID" 2>/dev/null || true
+  HTTP_PID=""
+  press ctrl-alt-f1
+}
+
 # ---------------------------------------------------------- cidata autoinstall
 
 # The configurator's own output files, synthesized for the 40G virtio disk the

@@ -665,9 +665,14 @@ render_failure() {
 
   if [[ -n $state_summary ]]; then
     blank_line
+    # The failed phase's error is the one thing the user must read, so wrap
+    # it at word boundaries rather than clip it: a multi-line error keeps its
+    # own line breaks, and an over-long line folds instead of losing its end.
     while IFS= read -r line; do
       [[ -n $line ]] || continue
-      center "${DIM}$(truncate_for_width "$line" "$CONTENT_WIDTH")${RESET}" "$CONTENT_WIDTH"
+      while IFS= read -r part; do
+        center "${DIM}${part}${RESET}" "$CONTENT_WIDTH"
+      done < <(fold -s -w "$CONTENT_WIDTH" <<<"$line")
     done <<<"$state_summary"
   fi
 
