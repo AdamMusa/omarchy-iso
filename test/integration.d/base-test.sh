@@ -402,6 +402,16 @@ EOF
   (cd "$BASE_DIR/www" && exec python3 -m http.server "$HTTP_PORT" --bind 127.0.0.1 >/dev/null 2>&1) &
   HTTP_PID=$!
 
+  if [[ $FIRMWARE == bios ]]; then
+    # ISOLINUX cancels its auto-boot countdown on any keystroke, so the
+    # ctrl-alt-f3 below would strand the VM at the boot menu. Commit the
+    # highlighted default (the install medium) with Enter first; a few presses
+    # catch the menu whenever it renders, and once booted they are harmless
+    # newlines (still well before the installer dashboard comes up).
+    local i
+    for i in 1 2 3; do press ret; sleep 2; done
+  fi
+
   local waited=0
   while true; do
     press ctrl-alt-f3
