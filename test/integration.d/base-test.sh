@@ -23,10 +23,18 @@ GUEST_HOSTNAME="omarchy-test"
 
 SCENARIO="${SCENARIO:-$(basename "${0%-test.sh}")}"
 
+# Firmware the VMs boot: uefi (OVMF, the default) or bios (SeaBIOS, legacy).
+# BIOS exercises the Limine MBR boot path that only real hardware covered; set
+# it with OMARCHY_INTEGRATION_FIRMWARE=bios or the runner's --bios flag. The
+# base image and its caches are kept per-firmware so the two never collide.
+FIRMWARE="${OMARCHY_INTEGRATION_FIRMWARE:-uefi}"
 OVMF_CODE="/usr/share/edk2/x64/OVMF_CODE.4m.fd"
 OVMF_VARS_TEMPLATE="/usr/share/edk2/x64/OVMF_VARS.4m.fd"
 
 BASE_DIR="$ROOT/test-runs/$(basename "$ISO" .iso)-integration"
+if [[ $FIRMWARE == bios ]]; then
+  BASE_DIR+="-bios"
+fi
 RUN_DIR="$BASE_DIR/runs/$(date +%Y%m%d-%H%M%S)-$SCENARIO"
 BASE_DISK="$BASE_DIR/base.qcow2"
 BASE_OVMF="$BASE_DIR/OVMF_VARS.4m.fd"
@@ -69,7 +77,9 @@ finish() {
 }
 
 base_image_ready() {
-  [[ -f $BASE_DISK && -f $BASE_OVMF && -f $SSH_KEY ]]
+  [[ -f $BASE_DISK && -f $SSH_KEY ]] || return 1
+  # UEFI keeps its NVRAM vars alongside the disk; BIOS has none.
+  [[ $FIRMWARE != uefi || -f $BASE_OVMF ]]
 }
 
 # ---------------------------------------------------------------- vm control
@@ -160,12 +170,21 @@ start_vm() {
   local disk="$1" serial="$2"
   shift 2
 
+  # UEFI needs the OVMF firmware pair; BIOS boots QEMU's built-in SeaBIOS with
+  # no pflash at all.
+  local firmware_args=()
+  if [[ $FIRMWARE == uefi ]]; then
+    firmware_args=(
+      -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE"
+      -drive if=pflash,format=raw,file="$ACTIVE_OVMF"
+    )
+  fi
+
   qemu-system-x86_64 \
     -cpu host -enable-kvm -machine q35,accel=kvm \
     -smp "$(nproc)" \
     -m "$MEMORY" \
-    -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
-    -drive if=pflash,format=raw,file="$ACTIVE_OVMF" \
+    "${firmware_args[@]}" \
     -drive file="$disk",format=qcow2,if=none,id=drive0 \
     -device virtio-blk-pci,drive=drive0,bootindex=1 \
     -device virtio-vga \
@@ -185,8 +204,10 @@ start_vm() {
 # leak between runs.
 start_vm_from_base() {
   qemu-img create -f qcow2 -b "$BASE_DISK" -F qcow2 "$RUN_DIR/run.qcow2" >/dev/null
-  cp "$BASE_OVMF" "$RUN_DIR/OVMF_VARS.4m.fd"
-  ACTIVE_OVMF="$RUN_DIR/OVMF_VARS.4m.fd"
+  if [[ $FIRMWARE == uefi ]]; then
+    cp "$BASE_OVMF" "$RUN_DIR/OVMF_VARS.4m.fd"
+    ACTIVE_OVMF="$RUN_DIR/OVMF_VARS.4m.fd"
+  fi
   start_vm "$RUN_DIR/run.qcow2" "$RUN_DIR/serial.log"
 }
 
@@ -584,9 +605,16 @@ install_phase() {
   # clean shutdown, so a failed install can never pass for a reusable base.
   rm -f "$BASE_DISK" "$BASE_DISK.building"
   qemu-img create -f qcow2 "$BASE_DISK.building" 40G >/dev/null
-  cp "$OVMF_VARS_TEMPLATE" "$BASE_OVMF"
-  ACTIVE_OVMF="$BASE_OVMF"
+  if [[ $FIRMWARE == uefi ]]; then
+    cp "$OVMF_VARS_TEMPLATE" "$BASE_OVMF"
+    ACTIVE_OVMF="$BASE_OVMF"
+  fi
 
+  # Boot the ISO from an optical drive under both firmwares: OVMF and SeaBIOS
+  # both boot an ide-cd reliably, and the boot-medium type has no bearing on
+  # what the BIOS run exercises (Limine's MBR install and boot). SeaBIOS will
+  # not boot the isohybrid image off a fallback USB device here, so USB is not
+  # worth the flakiness. The copytoram-off / USB path is covered by unit tests.
   start_vm "$BASE_DISK.building" "$RUN_DIR/install-serial.log" \
     -drive "file=$ISO,media=cdrom,if=none,format=raw,id=cdrom0" \
     -device ide-cd,drive=cdrom0,bootindex=2 \
