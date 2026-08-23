@@ -3,45 +3,45 @@
 # A corrupt install medium is refused before the disk is touched. The root
 # image ships on the ISO with its sha256 beside it; omarchy-root-image-verify
 # checks it at boot and the installer's pre-flight phase takes that verdict.
-# Flip one digit of the recorded checksum on a copy of the ISO, autoinstall
-# from it, and assert: the unit fails, the install halts in "Preparing install
-# target" telling the user to re-flash, nothing after that phase ran, and the
-# target disk still has no partition table.
+# Damage the image data on a copy of the ISO (the checksum stays right, the
+# bytes under it don't: a badly flashed stick), autoinstall from it, and
+# assert: the unit fails, the install halts in "Preparing install target"
+# telling the user to re-flash, nothing after that phase ran, and the target
+# disk still has no partition table.
 #
 # Boots the ISO itself, not the installed base image, so it needs no base.
 
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/base-test.sh"
 
 CORRUPT_ISO="$BASE_DIR/corrupt.iso"
-STREAM_SUM=arch/x86_64/omarchy-root.btrfs.sha256
+STREAM=arch/x86_64/omarchy-root.btrfs
 VERIFY_UNIT=omarchy-root-image-verify.service
 STATE=/run/omarchy-install/state.json
 
 # ------------------------------------------------------------------ fixture
 
-# A copy of the ISO with the first hex digit of the recorded checksum flipped.
-# ISO9660 carries no per-file integrity data, so patching the byte in place
-# leaves everything else on the medium intact; cp --reflink makes the copy
-# free on btrfs.
+# A copy of the ISO with 16 bytes of the root image overwritten (0xFF) a
+# third of the way in, deep in extent data. ISO9660 carries no per-file integrity
+# data, so patching in place leaves everything else on the medium intact
+# (cp --reflink makes the copy free on btrfs). The stream is found by the
+# NUL-terminated magic every btrfs send stream starts with; its length comes
+# from the ISO's directory.
 corrupt_iso() {
-  local digest offset flipped patched
+  local start size offset
+  local damage='\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff'
 
-  digest=$(bsdtar -xOf "$ISO" "$STREAM_SUM" | cut -d' ' -f1)
-  [[ $digest =~ ^[0-9a-f]{64}$ ]] || { echo "no checksum on the ISO at $STREAM_SUM" >&2; return 1; }
+  size=$(bsdtar -tvf "$ISO" "$STREAM" | awk '{print $5}')
+  [[ $size =~ ^[0-9]+$ ]] || { echo "no root image on the ISO at $STREAM" >&2; return 1; }
 
-  log "Copying the ISO and corrupting its root image checksum"
+  log "Copying the ISO and corrupting its root image"
   rm -f "$CORRUPT_ISO"
   cp --reflink=auto "$ISO" "$CORRUPT_ISO"
-  offset=$(grep -boa -m1 "$digest" "$CORRUPT_ISO" | cut -d: -f1)
-  [[ -n $offset ]] || { echo "checksum not found in the ISO image" >&2; return 1; }
-  flipped=1
-  [[ ${digest:0:1} == 1 ]] && flipped=0
-  printf '%s' "$flipped" | dd of="$CORRUPT_ISO" bs=1 seek="$offset" conv=notrunc status=none
+  start=$(grep -Pboa -m1 'btrfs-stream\x00' "$CORRUPT_ISO" | cut -d: -f1)
+  [[ -n $start ]] || { echo "btrfs send stream magic not found in the ISO image" >&2; return 1; }
 
-  patched=$(bsdtar -xOf "$CORRUPT_ISO" "$STREAM_SUM" | cut -d' ' -f1)
-  [[ $patched =~ ^[0-9a-f]{64}$ && $patched != "$digest" ]] ||
-    { echo "patch did not take: $patched" >&2; return 1; }
-  log "Recorded $digest, now $patched"
+  offset=$((start + size / 3))
+  echo -ne "$damage" | dd of="$CORRUPT_ISO" bs=1 seek="$offset" conv=notrunc status=none
+  log "Image damaged at stream offset $((size / 3))"
 }
 
 # -------------------------------------------------------------------- phases
@@ -91,7 +91,7 @@ screen_shows() {
 }
 
 assert_refused() {
-  check "verify unit failed on the corrupt checksum" \
+  check "verify unit failed on the corrupt image" \
     ssh_live_root "systemctl show -p Result --value $VERIFY_UNIT | grep -qx exit-code"
   check "install halted in the pre-flight phase" \
     ssh_live_root "jq -e '[.phases[] | select(.status == \"failed\") | .name] == [\"Preparing install target\"]' $STATE"
