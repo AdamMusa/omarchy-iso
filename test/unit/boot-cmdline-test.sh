@@ -12,6 +12,11 @@
 # That path loop-mounts the image, so archisodevice is /dev/loopN rather than
 # /dev/sr*, and the auto rule fires there too. It is matched on archisobasedir
 # rather than archisosearchuuid because it finds the medium by img_dev/img_loop.
+#
+# The PXE entries count too: the NBD and NFS hooks force copytoram=y unless
+# the cmdline says exactly n, and both keep the server's image tree mounted,
+# so pinned they can still stream the root image. HTTP cannot -- its hook only
+# downloads the airootfs into a tmpfs -- so no entry may use archiso_http_srv.
 
 set -euo pipefail
 
@@ -19,11 +24,16 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$ROOT"
 
 entries=$(grep -rhE '^\s*(APPEND|linux|options)\s.*archisobasedir=' \
-  configs/syslinux/archiso_sys-linux.cfg configs/grub/grub.cfg \
-  configs/grub/loopback.cfg configs/efiboot/loader/entries)
+  configs/syslinux/archiso_sys-linux.cfg configs/syslinux/archiso_pxe-linux.cfg \
+  configs/grub/grub.cfg configs/grub/loopback.cfg configs/efiboot/loader/entries)
 
 count=$(printf '%s\n' "$entries" | wc -l)
-[ "$count" -ge 7 ] || { echo "expected at least 7 boot entries, found $count"; exit 1; }
+[ "$count" -ge 9 ] || { echo "expected at least 9 boot entries, found $count"; exit 1; }
+
+if grep -rq archiso_http_srv configs/syslinux configs/grub configs/efiboot; then
+  echo "HTTP PXE entry found: that path copies only the airootfs to RAM, so the root image is never on the medium and an install can never succeed"
+  exit 1
+fi
 
 fail=0
 while IFS= read -r line; do
