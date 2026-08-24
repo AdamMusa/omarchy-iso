@@ -52,8 +52,10 @@ install_from_corrupt_medium() {
   build_cidata
 
   qemu-img create -f qcow2 "$RUN_DIR/disk.qcow2" 40G >/dev/null
-  cp "$OVMF_VARS_TEMPLATE" "$RUN_DIR/OVMF_VARS.4m.fd"
-  ACTIVE_OVMF="$RUN_DIR/OVMF_VARS.4m.fd"
+  if [[ $FIRMWARE == uefi ]]; then
+    cp "$OVMF_VARS_TEMPLATE" "$RUN_DIR/OVMF_VARS.4m.fd"
+    ACTIVE_OVMF="$RUN_DIR/OVMF_VARS.4m.fd"
+  fi
 
   log "Autoinstalling from the corrupt medium (headless)"
   start_vm "$RUN_DIR/disk.qcow2" "$RUN_DIR/serial.log" \

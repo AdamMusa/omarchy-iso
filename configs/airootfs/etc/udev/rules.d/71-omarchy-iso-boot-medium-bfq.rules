@@ -9,8 +9,12 @@
 # the hash takes. With BFQ the idle-class hash yields to the live system and
 # fills the gaps instead.
 #
-# Scoped to the media an ISO realistically boots from: USB disks, SD cards and
-# optical drives. Internal SATA/NVMe install targets keep their default.
+# Matched wider than just the boot medium, on purpose (udev cannot know which
+# disk we booted from): every USB whole disk, including a USB install target
+# or a cidata drive; optical drives; and every mmcblk node, including internal
+# eMMC and its boot0/rpmb partitions. The consequence is only the scheduler
+# choice, and BFQ is a fine default on all of them. Internal SATA/NVMe keep
+# their default.
 # 71- so it runs after 60-persistent-storage.rules, which sets ID_BUS.
 ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", ENV{ID_BUS}=="usb", ATTR{queue/scheduler}="bfq"
 ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL=="sr[0-9]*|mmcblk[0-9]*", ATTR{queue/scheduler}="bfq"
