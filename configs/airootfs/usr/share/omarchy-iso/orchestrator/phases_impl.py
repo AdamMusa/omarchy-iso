@@ -138,6 +138,7 @@ ROOT_IMAGE_SUBVOLUME = "omarchy-root"
 # verdict through this helper, which logs the boot medium and its I/O scheduler,
 # waits for the unit if it is still hashing, and starts it if it never ran.
 ROOT_IMAGE_VERIFY_HELPER = "/usr/local/bin/omarchy-wait-root-image-verify"
+ROOT_IMAGE_VERIFY_UNIT = "omarchy-root-image-verify.service"
 
 
 BOOT_MEDIUM_MOUNT = Path("/run/archiso/bootmnt")
@@ -273,6 +274,7 @@ def verify_root_image_stream(ctx: InstallContext) -> None:
     partitions, so both disk-touching paths clear the same check; whoever gets
     there first pays the wait. The hasher's read also leaves as much of the
     stream as fits in the page cache for the unpack that follows."""
+    _publish_verify_progress(ctx)
     try:
         result = subprocess.run(
             [ROOT_IMAGE_VERIFY_HELPER],
@@ -290,6 +292,54 @@ def verify_root_image_stream(ctx: InstallContext) -> None:
             result.stderr.strip()
             or f"{ROOT_IMAGE_VERIFY_HELPER} failed with status {result.returncode}"
         )
+
+
+def _publish_verify_progress(ctx: InstallContext) -> None:
+    """While the boot-time hasher is still reading the stream, mirror its read
+    position into phase_progress so the dashboard bar tracks the actual hash
+    instead of the phase's time-driven band. Best effort throughout: the
+    helper is the authority on the verdict, and any hiccup here (unit already
+    done, hasher between opens, /proc gone) just skips a sample."""
+    try:
+        total = ROOT_IMAGE_STREAM.stat().st_size
+    except OSError:
+        return
+    while total and _verify_unit_property("ActiveState") == "activating":
+        pos = _hasher_read_pos()
+        if pos is not None:
+            _write_phase_progress(ctx, pos / total)
+        time.sleep(0.5)
+
+
+def _verify_unit_property(prop: str) -> str:
+    res = subprocess.run(
+        ["systemctl", "show", ROOT_IMAGE_VERIFY_UNIT, "-p", prop, "--value"],
+        capture_output=True, text=True, check=False,
+    )
+    return res.stdout.strip()
+
+
+def _hasher_read_pos() -> int | None:
+    """Byte offset of the hasher's open fd on the stream: the unit's MainPID
+    is sha256sum while it runs, and fdinfo's pos is how far it has read."""
+    pid = _verify_unit_property("MainPID")
+    if not pid.isdigit() or pid == "0":
+        return None
+    fd_dir = Path("/proc") / pid / "fd"
+    try:
+        for fd in fd_dir.iterdir():
+            try:
+                if fd.resolve() != ROOT_IMAGE_STREAM:
+                    continue
+                fdinfo = (fd_dir.parent / "fdinfo" / fd.name).read_text()
+            except OSError:
+                continue
+            for line in fdinfo.splitlines():
+                if line.startswith("pos:"):
+                    return int(line.split()[1])
+    except OSError:
+        pass
+    return None
 
 
 def arch_install_system(ctx: InstallContext) -> None:

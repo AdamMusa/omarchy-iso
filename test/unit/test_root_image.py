@@ -6,6 +6,7 @@ the image can land on) and the destructive subvolume dance in _install_root_imag
 asserted on the subprocess calls against a temp target.
 """
 
+import os
 import shutil
 import sys
 import tempfile
@@ -130,6 +131,44 @@ class VerifyRootImageStreamTest(unittest.TestCase):
                                side_effect=FileNotFoundError("no helper")):
             with self.assertRaisesRegex(RuntimeError, "could not run"):
                 phases_impl.verify_root_image_stream(self.ctx)
+
+
+class PublishVerifyProgressTest(unittest.TestCase):
+    """_publish_verify_progress mirrors the hasher's fdinfo read position into
+    phase_progress while the unit is activating. Our own unbuffered fd on a
+    temp stream stands in for sha256sum's, with MainPID pointed at this
+    process."""
+
+    def test_mirrors_hasher_read_position(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stream = (Path(tmp) / "omarchy-root.btrfs").resolve()
+            stream.write_bytes(b"\0" * 4096)
+            states = iter(["activating", "active"])
+
+            def unit_property(prop):
+                return next(states) if prop == "ActiveState" else str(os.getpid())
+
+            fractions = []
+            fd = os.open(stream, os.O_RDONLY)
+            try:
+                os.read(fd, 1024)
+                with mock.patch.object(phases_impl, "ROOT_IMAGE_STREAM", stream), \
+                     mock.patch.object(phases_impl, "_verify_unit_property",
+                                       side_effect=unit_property), \
+                     mock.patch.object(phases_impl, "_write_phase_progress",
+                                       side_effect=lambda ctx, f: fractions.append(f)), \
+                     mock.patch.object(phases_impl.time, "sleep"):
+                    phases_impl._publish_verify_progress(ctx=None)
+            finally:
+                os.close(fd)
+            self.assertEqual(fractions, [0.25])
+
+    def test_missing_stream_is_a_no_op(self):
+        with mock.patch.object(phases_impl, "ROOT_IMAGE_STREAM",
+                               Path("/nonexistent/omarchy-root.btrfs")), \
+             mock.patch.object(phases_impl, "_verify_unit_property") as show:
+            phases_impl._publish_verify_progress(ctx=None)
+        show.assert_not_called()
 
 
 class PrepareInstallTargetTest(unittest.TestCase):
