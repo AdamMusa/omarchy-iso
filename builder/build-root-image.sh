@@ -6,7 +6,8 @@
 # The target install is the same ~940 packages for everyone; only the kernel,
 # CPU microcode, audio firmware and Tailscale vary per machine. So pacstrap the
 # invariant set once here, at build time, into a btrfs subvolume compressed at
-# the same zstd level the installer mounts the target with, and ship it as a
+# a high zstd level (see IMAGE_COMPRESS below — higher than the installer's own
+# compress=zstd, since the level only costs build time), and ship it as a
 # `btrfs send --compressed-data` stream. At install time `btrfs receive` writes
 # the compressed extents straight to disk (no decompress/recompress), which
 # measured at roughly half the time of extracting the same packages with pacman,
