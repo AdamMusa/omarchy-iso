@@ -26,9 +26,10 @@ check() { # desc, expected_rc, actual_rc, [needle in output], [output]
 
 # A sandbox with a fake boot medium and stub tools on PATH. ACTIVE_SEQ is the
 # newline-separated ActiveState values `systemctl show ... ActiveState` returns
-# on successive calls (last one repeats); LOADSTATE and START_RC tune the rest.
-run_helper() { # loadstate, active_seq, start_rc  ->  sets RC and OUT
-  local loadstate=$1 active_seq=$2 start_rc=$3
+# on successive calls (last one repeats); LOADSTATE, START_RC and RESULT (the
+# unit's Result property, exit-code unless overridden) tune the rest.
+run_helper() { # loadstate, active_seq, start_rc, [result]  ->  sets RC and OUT
+  local loadstate=$1 active_seq=$2 start_rc=$3 result=${4:-exit-code}
   local box; box=$(mktemp -d)
   mkdir -p "$box/bin" "$box/medium/arch/x86_64" "$box/sys/block/sdz/queue"
   : >"$box/medium/arch/x86_64/omarchy-root.btrfs"
@@ -51,10 +52,11 @@ EOF
   # systemctl show -p LoadState|ActiveState --value ; systemctl start ...
   cat >"$box/bin/systemctl" <<EOF
 #!/bin/bash
-box="$box"; start_rc=$start_rc; loadstate="$loadstate"
+box="$box"; start_rc=$start_rc; loadstate="$loadstate"; result="$result"
 if [[ \$1 == show ]]; then
   case "\$*" in
     *LoadState*)  echo "\$loadstate" ;;
+    *Result*)     echo "\$result" ;;
     *ActiveState*)
       # pop the first remaining line; keep the last forever
       mapfile -t seq <"\$box/active_seq"
@@ -95,6 +97,11 @@ check "waits for a running unit then passes" 0 "$RC" "waiting for" "$OUT"
 # Hash failed: corrupt medium, re-flash message leads.
 run_helper loaded "failed" 0
 check "failed unit is a corrupt medium" 1 "$RC" "install medium is corrupt: re-flash it" "$OUT"
+
+# Hash hit the size-based TimeoutStartSec: the medium stalls reads. Distinct
+# advice -- re-flashing the same stick would not help.
+run_helper loaded "failed" 0 timeout
+check "timed-out unit is a slow medium" 1 "$RC" "install medium is too slow" "$OUT"
 
 # Never started and start leaves it inactive: cannot verify.
 run_helper loaded "inactive" 0
