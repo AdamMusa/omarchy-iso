@@ -14,12 +14,18 @@
 # anything that is not crypt or still in use, so the close attempts cannot
 # take down more than what the target held.
 #
+# Extra arguments name mappers to close beyond what the mount table shows:
+# a failure between luksOpen and mount leaves a mapper open with nothing
+# mounted from it, which the table sweep cannot see.
+#
 # Idempotent: a target with nothing mounted exits 0. Exits nonzero only when
 # the tree is (still) mounted and umount -R failed.
 
 set -uo pipefail
 
-target="${1:?usage: omarchy-release-install-target <mountpoint>}"
+target="${1:?usage: omarchy-release-install-target <mountpoint> [mapper ...]}"
+shift
+mappers=("$@")
 
 sync
 
@@ -27,7 +33,6 @@ while IFS=' ' read -r swap_path _; do
   [[ $swap_path == "$target"/* ]] && swapoff "$swap_path" 2>/dev/null
 done < <(tail -n +2 /proc/swaps 2>/dev/null)
 
-mappers=()
 while IFS= read -r source; do
   source="${source%%\[*}"
   [[ $source == /dev/mapper/* ]] && mappers+=("${source#/dev/mapper/}")
