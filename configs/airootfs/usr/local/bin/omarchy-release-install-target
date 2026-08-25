@@ -1,0 +1,32 @@
+#!/bin/bash
+#
+# Release the install target: deactivate every swap area under it, then
+# recursively unmount it. The one source of truth for letting go of the
+# target — the dashboard runs it before offering the install medium's
+# removal, and the orchestrator's protected-failure cleanup runs it before
+# closing the LUKS mapper.
+#
+# The swapoff comes first because active swap is an invisible holder: the
+# hibernation setup's swapon in the chroot lands in the shared kernel, fuser
+# then shows no process and the submounts unmount fine, yet the filesystem
+# reports busy until the swap is off.
+#
+# Idempotent: a target with nothing mounted exits 0. Exits nonzero only when
+# the tree is (still) mounted and umount -R failed.
+
+set -uo pipefail
+
+target="${1:?usage: omarchy-release-install-target <mountpoint>}"
+
+sync
+
+while IFS=' ' read -r swap_path _; do
+  [[ $swap_path == "$target"/* ]] && swapoff "$swap_path" 2>/dev/null
+done < <(tail -n +2 /proc/swaps 2>/dev/null)
+
+if mountpoint -q "$target"; then
+  umount -R "$target" || exit 1
+fi
+
+sync
+exit 0

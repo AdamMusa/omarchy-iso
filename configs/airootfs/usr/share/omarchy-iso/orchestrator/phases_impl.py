@@ -2258,21 +2258,6 @@ def cleanup_target_hook_masks(ctx: InstallContext) -> None:
     _unmask_mkinitcpio_pacman_hooks(ctx, ctx.target, TARGET_DEFERRED_BOOT_HOOKS)
 
 
-def _swapoff_under(target: Path) -> None:
-    """Deactivate every swap area on the target. The hibernation setup's
-    swapon in the chroot lands in the shared kernel, and active swap is an
-    invisible mount holder: fuser shows no process, yet umount -R reports
-    busy until the swapoff."""
-    try:
-        entries = Path("/proc/swaps").read_text().splitlines()[1:]
-    except OSError:
-        return
-    for entry in entries:
-        swap_path = entry.split()[0]
-        if swap_path.startswith(f"{target}/"):
-            subprocess.run(["swapoff", swap_path], check=False, capture_output=True)
-
-
 def cleanup_protected_state(ctx: InstallContext) -> None:
     """Tear down protected-mode mounts and LUKS mapper after a failed install.
 
@@ -2282,8 +2267,12 @@ def cleanup_protected_state(ctx: InstallContext) -> None:
     if not ctx.is_protected:
         return
 
-    _swapoff_under(ctx.target)
-    subprocess.run(["umount", "-R", str(ctx.target)], check=False, capture_output=True)
+    # Swapoff-then-umount; shared with the dashboard's pre-reboot release.
+    subprocess.run(
+        ["omarchy-release-install-target", str(ctx.target)],
+        check=False,
+        capture_output=True,
+    )
     if Path("/dev/mapper/omarchy_root").exists():
         subprocess.run(
             ["cryptsetup", "close", "omarchy_root"],
