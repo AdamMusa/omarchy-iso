@@ -38,8 +38,21 @@ while IFS= read -r source; do
   [[ $source == /dev/mapper/* ]] && mappers+=("${source#/dev/mapper/}")
 done < <(findmnt -rn -o SOURCE -R "$target" 2>/dev/null | sort -u)
 
+# On failure, name the holders on stderr: this is the diagnosis the swapfile
+# hunt needed once, done by the machine. fuser over lsof because the live
+# ISO ships psmisc and not lsof, and the holder table is what gets acted on.
 if mountpoint -q "$target"; then
-  umount -R "$target" || exit 1
+  if ! umount -R "$target"; then
+    {
+      echo "could not unmount $target; holders:"
+      fuser -vm "$target" 2>&1
+      echo "still mounted under it:"
+      findmnt -rn -R "$target"
+      echo "active swap:"
+      tail -n +2 /proc/swaps
+    } >&2
+    exit 1
+  fi
 fi
 
 # A mapper can be mounted outside the target tree too: the orchestrator
@@ -50,7 +63,13 @@ for mapper in "${mappers[@]}"; do
   while IFS= read -r mountpoint; do
     umount -R "$mountpoint" 2>/dev/null
   done < <(findmnt -rn -o TARGET -S "/dev/mapper/$mapper" 2>/dev/null)
-  cryptsetup close "$mapper" 2>/dev/null
+  if ! cryptsetup close "$mapper" 2>/dev/null && [[ -e /dev/mapper/$mapper ]]; then
+    {
+      echo "could not close mapper $mapper; holders:"
+      fuser -vm "/dev/mapper/$mapper" 2>&1
+      dmsetup info "$mapper" 2>&1
+    } >&2
+  fi
 done
 
 sync

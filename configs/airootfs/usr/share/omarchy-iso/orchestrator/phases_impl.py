@@ -2270,9 +2270,13 @@ def cleanup_protected_state(ctx: InstallContext) -> None:
     # Swapoff, umount -R, and close of the mappers the mounts were backed by;
     # shared with the dashboard's pre-reboot release. omarchy_root is named
     # explicitly because a failure between luksOpen and mount leaves it open
-    # with nothing in the mount table for the release to see.
-    subprocess.run(
+    # with nothing in the mount table for the release to see. On failure the
+    # script names the holders on stderr; surface that in the install log.
+    result = subprocess.run(
         ["omarchy-release-install-target", str(ctx.target), "omarchy_root"],
         check=False,
         capture_output=True,
+        text=True,
     )
+    for line in (result.stderr or "").splitlines():
+        info(f"release: {line}")

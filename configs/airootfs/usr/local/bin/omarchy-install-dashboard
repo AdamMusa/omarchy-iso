@@ -585,11 +585,17 @@ render_finish() {
 # the other ttys, but one mount command away for whoever wants it.
 
 release_target() {
-  local target
+  local target out line
   target=$(jq -r '.target // "/mnt"' "$STATE_FILE" 2>/dev/null) || target=/mnt
-  # Swapoff-then-umount, shared with the orchestrator's failure cleanup.
-  omarchy-release-install-target "$target" 2>/dev/null ||
+  # Swapoff, umount, mapper close — shared with the orchestrator's failure
+  # cleanup. On failure the script names the holders on stderr; forward that
+  # into the install log, where the diagnosis is worth more than a shrug.
+  if ! out=$(omarchy-release-install-target "$target" 2>&1); then
     dashboard_log "release: could not release $target"
+  fi
+  while IFS= read -r line; do
+    [[ -n $line ]] && dashboard_log "release: $line"
+  done <<<"${out:-}"
 }
 
 warm_reboot_path() {
