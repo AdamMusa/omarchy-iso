@@ -585,9 +585,15 @@ render_finish() {
 # the other ttys, but one mount command away for whoever wants it.
 
 release_target() {
-  local target
+  local target swapfile
   target=$(jq -r '.target // "/mnt"' "$STATE_FILE" 2>/dev/null) || target=/mnt
   sync
+  # The hibernation setup leaves the target's swapfile active, and swap is an
+  # invisible holder: no process shows in fuser, submounts unmount fine, and
+  # the btrfs still refuses to release until the swapoff.
+  while IFS= read -r swapfile; do
+    [[ $swapfile == "$target"/* ]] && swapoff "$swapfile" 2>/dev/null
+  done < <(awk 'NR > 1 { print $1 }' /proc/swaps)
   umount -R "$target" 2>/dev/null || dashboard_log "release: umount -R $target failed"
   sync
 }
