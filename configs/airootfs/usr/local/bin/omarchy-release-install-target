@@ -1,15 +1,18 @@
 #!/bin/bash
 #
-# Release the install target: deactivate every swap area under it, then
-# recursively unmount it. The one source of truth for letting go of the
-# target — the dashboard runs it before offering the install medium's
-# removal, and the orchestrator's protected-failure cleanup runs it before
-# closing the LUKS mapper.
+# Release the install target: deactivate every swap area under it,
+# recursively unmount it, and close the LUKS mappers that backed it. The one
+# source of truth for letting go of the target — the dashboard runs it
+# before offering the install medium's removal, and the orchestrator's
+# protected-failure cleanup runs it before its own stale-mapper sweep.
 #
 # The swapoff comes first because active swap is an invisible holder: the
 # hibernation setup's swapon in the chroot lands in the shared kernel, fuser
 # then shows no process and the submounts unmount fine, yet the filesystem
-# reports busy until the swap is off.
+# reports busy until the swap is off. The mappers to close are read off the
+# mount table before the unmount empties it; cryptsetup itself refuses
+# anything that is not crypt or still in use, so the close attempts cannot
+# take down more than what the target held.
 #
 # Idempotent: a target with nothing mounted exits 0. Exits nonzero only when
 # the tree is (still) mounted and umount -R failed.
@@ -24,9 +27,19 @@ while IFS=' ' read -r swap_path _; do
   [[ $swap_path == "$target"/* ]] && swapoff "$swap_path" 2>/dev/null
 done < <(tail -n +2 /proc/swaps 2>/dev/null)
 
+mappers=()
+while IFS= read -r source; do
+  source="${source%%\[*}"
+  [[ $source == /dev/mapper/* ]] && mappers+=("${source#/dev/mapper/}")
+done < <(findmnt -rn -o SOURCE -R "$target" 2>/dev/null | sort -u)
+
 if mountpoint -q "$target"; then
   umount -R "$target" || exit 1
 fi
+
+for mapper in "${mappers[@]}"; do
+  cryptsetup close "$mapper" 2>/dev/null
+done
 
 sync
 exit 0

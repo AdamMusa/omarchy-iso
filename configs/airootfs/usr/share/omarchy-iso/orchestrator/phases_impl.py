@@ -2267,12 +2267,16 @@ def cleanup_protected_state(ctx: InstallContext) -> None:
     if not ctx.is_protected:
         return
 
-    # Swapoff-then-umount; shared with the dashboard's pre-reboot release.
+    # Swapoff, umount -R, and close of the mappers the mounts were backed by;
+    # shared with the dashboard's pre-reboot release.
     subprocess.run(
         ["omarchy-release-install-target", str(ctx.target)],
         check=False,
         capture_output=True,
     )
+    # The release only closes mappers it saw mounted: a failure between
+    # luksOpen and mount leaves omarchy_root open with nothing in the mount
+    # table, so this specific close stays as the fallback.
     if Path("/dev/mapper/omarchy_root").exists():
         subprocess.run(
             ["cryptsetup", "close", "omarchy_root"],
