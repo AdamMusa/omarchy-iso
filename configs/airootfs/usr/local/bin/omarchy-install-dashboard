@@ -161,7 +161,8 @@ LAST_PM=10
 # one button — so the last thing the installer shows matches the first. It runs
 # one row taller: `gum confirm` always paints prompt/blank/button and clears all
 # three, so the button cannot sit closer than two rows under a title we drew.
-# Two more rows under the button: a blank and the medium-removal note.
+# Two more rows between title and button: a blank and the medium-removal
+# note — above the prompt, because gum clears everything under its view.
 FINISH_HEIGHT=$((LOGO_HEIGHT + 7))
 FINISH_TOP_ROW=2
 
@@ -539,6 +540,11 @@ render_finish() {
     blank_line
     center "Installed Omarchy in ${duration}" "$CONTENT_WIDTH"
     blank_line
+    # Above the button, not below: gum clears everything under its view on
+    # each repaint, so a line below the prompt would be erased. True because
+    # of warm_reboot_path + release_target_and_reboot: from here to the
+    # reboot syscall nothing reads the install medium again.
+    center "${DIM}You can now remove the install medium${RESET}" "$CONTENT_WIDTH"
   } >"$TTY_PATH"
 
   if [[ -f $LOGO_PATH ]]; then
@@ -562,13 +568,6 @@ render_finish() {
       >"$TTY_PATH" 2>/dev/null || dashboard_log "logo effect skipped (ttfx exited $?)"
     printf '%s%d;1H' "$CSI" "$((FINISH_TOP_ROW + LOGO_HEIGHT + 5))" >"$TTY_PATH"
   fi
-
-  # True because of warm_reboot_path + release_target_and_reboot: from here to
-  # the reboot syscall nothing reads the install medium again.
-  {
-    printf '%s%d;1H' "$CSI" "$((FINISH_TOP_ROW + LOGO_HEIGHT + 6))"
-    center "${DIM}You can now remove the install medium${RESET}" "$CONTENT_WIDTH"
-  } >"$TTY_PATH"
 }
 
 # ── Medium-free reboot ──────────────────────────────────────────────────────
@@ -612,9 +611,9 @@ reboot_prompt() {
   interactive || return 0
 
   # gum paints its prompt row at the cursor and the button two rows under it, so
-  # anchor on the row right below the title to put the button as close to it as
-  # gum allows. FINISH_HEIGHT budgets for the same three rows.
-  printf '%s%d;1H%s' "$CSI" "$((FINISH_TOP_ROW + LOGO_HEIGHT + 2))" "$CLEAR_LINE" >"$TTY_PATH"
+  # anchor on the row right below the removal note to put the button as close
+  # to it as gum allows. FINISH_HEIGHT budgets for the same three rows.
+  printf '%s%d;1H%s' "$CSI" "$((FINISH_TOP_ROW + LOGO_HEIGHT + 4))" "$CLEAR_LINE" >"$TTY_PATH"
 
   prompt_pad=$(( ( $(term_cols) - 18 ) / 2 ))
   (( prompt_pad < 0 )) && prompt_pad=0
