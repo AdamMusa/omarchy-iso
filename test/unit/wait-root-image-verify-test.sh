@@ -34,6 +34,18 @@ run_helper() { # loadstate, active_seq, start_rc, [result]  ->  sets RC and OUT
   mkdir -p "$box/bin" "$box/medium/arch/x86_64" "$box/sys/block/sdz/queue"
   : >"$box/medium/arch/x86_64/omarchy-root.btrfs"
   : >"$box/medium/arch/x86_64/omarchy-root.btrfs.sha256"
+
+  # WITH_HASHER_PROC=1: a fake hasher (pid 4242) holds the stream at pos 512
+  # of 1024 bytes, and the helper draws progress into $box/progress. The shim
+  # rewrites /proc to the sandbox, so hash_pct reads this fixture.
+  local mainpid=0
+  if [[ -n ${WITH_HASHER_PROC:-} ]]; then
+    mainpid=4242
+    head -c 1024 /dev/zero >"$box/medium/arch/x86_64/omarchy-root.btrfs"
+    mkdir -p "$box/proc/4242/fd" "$box/proc/4242/fdinfo"
+    ln -s "$box/medium/arch/x86_64/omarchy-root.btrfs" "$box/proc/4242/fd/7"
+    printf 'pos:\t512\nflags:\t0100000\n' >"$box/proc/4242/fdinfo/7"
+  fi
   echo "none mq-deadline kyber [bfq]" >"$box/sys/block/sdz/queue/scheduler"
   printf '%s\n' "$active_seq" >"$box/active_seq"
 
@@ -52,11 +64,12 @@ EOF
   # systemctl show -p LoadState|ActiveState --value ; systemctl start ...
   cat >"$box/bin/systemctl" <<EOF
 #!/bin/bash
-box="$box"; start_rc=$start_rc; loadstate="$loadstate"; result="$result"
+box="$box"; start_rc=$start_rc; loadstate="$loadstate"; result="$result"; mainpid=$mainpid
 if [[ \$1 == show ]]; then
   case "\$*" in
     *LoadState*)  echo "\$loadstate" ;;
     *Result*)     echo "\$result" ;;
+    *MainPID*)    echo "\$mainpid" ;;
     *ActiveState*)
       # pop the first remaining line; keep the last forever
       mapfile -t seq <"\$box/active_seq"
@@ -76,13 +89,18 @@ EOF
   local shim="$box/run-helper"
   sed -e "s#/run/archiso/bootmnt#$box/medium#g" \
       -e "s#/sys/block#$box/sys/block#g" \
+      -e "s#/proc/#$box/proc/#g" \
       "$HELPER" >"$shim"
   chmod +x "$shim"
 
+  local progress_env=()
+  [[ -n ${WITH_HASHER_PROC:-} ]] && progress_env=(OMARCHY_VERIFY_PROGRESS="$box/progress")
+
   set +e
-  OUT=$(PATH="$box/bin:$PATH" bash "$shim" 2>&1)
+  OUT=$(PATH="$box/bin:$PATH" env "${progress_env[@]}" bash "$shim" 2>&1)
   RC=$?
   set -e
+  PROGRESS_OUT=$(cat "$box/progress" 2>/dev/null || true)
   rm -rf "$box"
 }
 
@@ -93,6 +111,23 @@ check "active unit passes" 0 "$RC" "scheduler: none mq-deadline kyber [bfq]" "$O
 # Still hashing, then completes: waits, then passes.
 run_helper loaded $'activating\nactivating\nactive' 0
 check "waits for a running unit then passes" 0 "$RC" "waiting for" "$OUT"
+
+# With OMARCHY_VERIFY_PROGRESS set and a hasher pid to read, the wait draws a
+# live percent (fixture: pos 512 of 1024 -> 50%) and finishes the line at 100%
+# on success. Progress goes to the given path, never into stdout/stderr.
+WITH_HASHER_PROC=1 run_helper loaded $'activating\nactivating\nactive' 0
+check "progress line drawn while hashing" 0 "$RC" "" "$OUT"
+[[ $PROGRESS_OUT == *" 50%"* && $PROGRESS_OUT == *"100%"* ]] &&
+  echo "ok: progress shows 50% then 100%" ||
+  { echo "FAIL: progress output wrong: $(printf '%q' "$PROGRESS_OUT")"; fails=1; }
+[[ $OUT == *"50%"* ]] && { echo "FAIL: percent leaked into stdout/stderr"; fails=1; } || true
+
+# A failed hash ends the progress line without the cosmetic 100%. (The first
+# ActiveState answer is consumed by the inactive check before the wait loop.)
+WITH_HASHER_PROC=1 run_helper loaded $'activating\nactivating\nfailed' 0
+[[ $PROGRESS_OUT == *" 50%"* && $PROGRESS_OUT != *"100%"* ]] &&
+  echo "ok: failed hash ends progress without 100%" ||
+  { echo "FAIL: failed-hash progress wrong: $(printf '%q' "$PROGRESS_OUT")"; fails=1; }
 
 # Hash failed: corrupt medium, re-flash message leads.
 run_helper loaded "failed" 0
