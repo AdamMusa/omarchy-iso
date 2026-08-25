@@ -575,32 +575,30 @@ render_finish() {
 # The live root pages from the install medium on demand (copytoram=n keeps
 # the root image reachable during the install), so pulling the stick is only
 # safe once nothing will fault a cold read anymore. A graceful reboot is the
-# opposite of that: its stop jobs page unit files and ExecStop binaries. So:
-# while the medium is still present, pre-fault everything the button press
-# needs; at the press, release the target — held mounted until now so the
-# other ttys can inspect it — sync, and take the immediate reboot path. The
-# medium itself is read-only and the live logs are tmpfs: after umount -R of
-# the target nothing anywhere is dirty, which is what makes -ff clean here.
+# opposite of that: its stop jobs page unit files and ExecStop binaries. So,
+# before the finish screen offers the medium's removal: release the target —
+# fully written to its own disk from that moment, whatever happens after —
+# and pre-fault the one binary the button press still runs. The medium is
+# read-only and the live logs are tmpfs, so past the umount nothing anywhere
+# is dirty, which is what makes the immediate reboot at the press clean.
+# The cost, accepted deliberately: the installed tree can no longer be
+# inspected from another tty between install and reboot.
 
-warm_reboot_path() {
-  local bin path dep
-  sync
-  for bin in umount systemctl sync jq; do
-    path=$(command -v "$bin" 2>/dev/null) || continue
-    cat "$path" >/dev/null 2>&1 || true
-    while IFS= read -r dep; do
-      [[ -f $dep ]] && cat "$dep" >/dev/null 2>&1
-    done < <(ldd "$path" 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^\//) print $i }')
-  done
-}
-
-release_target_and_reboot() {
+release_target() {
   local target
   target=$(jq -r '.target // "/mnt"' "$STATE_FILE" 2>/dev/null) || target=/mnt
   sync
-  umount -R "$target" 2>/dev/null || true
+  umount -R "$target" 2>/dev/null || dashboard_log "release: umount -R $target failed"
   sync
-  systemctl reboot -ff 2>/dev/null || reboot -f 2>/dev/null || true
+}
+
+warm_reboot_path() {
+  local path dep
+  path=$(command -v systemctl 2>/dev/null) || return 0
+  cat "$path" >/dev/null 2>&1 || true
+  while IFS= read -r dep; do
+    [[ -f $dep ]] && cat "$dep" >/dev/null 2>&1
+  done < <(ldd "$path" 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^\//) print $i }')
 }
 
 reboot_prompt() {
@@ -935,6 +933,12 @@ if [[ ${OMARCHY_UI_DEFER_PROVISIONING:-} == "yes" ]]; then
   exit 0
 fi
 
+# Before the screen that offers the medium's removal: the target is released
+# first, so the install is fully on its own disk before the user can act on
+# the note; the warm makes the button press itself medium-free.
+release_target 2>/dev/null || true
+warm_reboot_path 2>/dev/null || true
+
 set +e
 render_finish
 finish_render_status=$?
@@ -947,16 +951,12 @@ if (( finish_render_status != 0 )); then
   } >"$TTY_PATH" 2>/dev/null || true
 fi
 
-# Warm before the prompt: the removal note the finish screen shows is only
-# honest once the button press can run without the medium.
-warm_reboot_path 2>/dev/null || true
-
 if reboot_prompt; then
   if [[ ${OMARCHY_UI_AUTO_REBOOT:-} == "no" ]]; then
     exit 0
   fi
   printf '%s' "$CLEAR" >"$TTY_PATH" 2>/dev/null || true
-  release_target_and_reboot
+  systemctl reboot -ff 2>/dev/null || reboot -f 2>/dev/null || true
 fi
 
 exit 0
