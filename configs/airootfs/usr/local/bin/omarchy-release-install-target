@@ -4,7 +4,7 @@
 # recursively unmount it, and close the LUKS mappers that backed it. The one
 # source of truth for letting go of the target — the dashboard runs it
 # before offering the install medium's removal, and the orchestrator's
-# protected-failure cleanup runs it before its own stale-mapper sweep.
+# protected-failure cleanup runs it naming the mapper it may have opened.
 #
 # The swapoff comes first because active swap is an invisible holder: the
 # hibernation setup's swapon in the chroot lands in the shared kernel, fuser
