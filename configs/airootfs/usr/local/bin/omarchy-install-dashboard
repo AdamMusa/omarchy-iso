@@ -161,7 +161,8 @@ LAST_PM=10
 # one button — so the last thing the installer shows matches the first. It runs
 # one row taller: `gum confirm` always paints prompt/blank/button and clears all
 # three, so the button cannot sit closer than two rows under a title we drew.
-FINISH_HEIGHT=$((LOGO_HEIGHT + 5))
+# Two more rows under the button: a blank and the medium-removal note.
+FINISH_HEIGHT=$((LOGO_HEIGHT + 7))
 FINISH_TOP_ROW=2
 
 # ── Install progress ─────────────────────────────────────────────────────────
@@ -561,6 +562,46 @@ render_finish() {
       >"$TTY_PATH" 2>/dev/null || dashboard_log "logo effect skipped (ttfx exited $?)"
     printf '%s%d;1H' "$CSI" "$((FINISH_TOP_ROW + LOGO_HEIGHT + 5))" >"$TTY_PATH"
   fi
+
+  # True because of warm_reboot_path + release_target_and_reboot: from here to
+  # the reboot syscall nothing reads the install medium again.
+  {
+    printf '%s%d;1H' "$CSI" "$((FINISH_TOP_ROW + LOGO_HEIGHT + 6))"
+    center "${DIM}You can now remove the install medium${RESET}" "$CONTENT_WIDTH"
+  } >"$TTY_PATH"
+}
+
+# ── Medium-free reboot ──────────────────────────────────────────────────────
+#
+# The live root pages from the install medium on demand (copytoram=n keeps
+# the root image reachable during the install), so pulling the stick is only
+# safe once nothing will fault a cold read anymore. A graceful reboot is the
+# opposite of that: its stop jobs page unit files and ExecStop binaries. So:
+# while the medium is still present, pre-fault everything the button press
+# needs; at the press, release the target — held mounted until now so the
+# other ttys can inspect it — sync, and take the immediate reboot path. The
+# medium itself is read-only and the live logs are tmpfs: after umount -R of
+# the target nothing anywhere is dirty, which is what makes -ff clean here.
+
+warm_reboot_path() {
+  local bin path dep
+  sync
+  for bin in umount systemctl sync jq; do
+    path=$(command -v "$bin" 2>/dev/null) || continue
+    cat "$path" >/dev/null 2>&1 || true
+    while IFS= read -r dep; do
+      [[ -f $dep ]] && cat "$dep" >/dev/null 2>&1
+    done < <(ldd "$path" 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^\//) print $i }')
+  done
+}
+
+release_target_and_reboot() {
+  local target
+  target=$(jq -r '.target // "/mnt"' "$STATE_FILE" 2>/dev/null) || target=/mnt
+  sync
+  umount -R "$target" 2>/dev/null || true
+  sync
+  systemctl reboot -ff 2>/dev/null || reboot -f 2>/dev/null || true
 }
 
 reboot_prompt() {
@@ -907,12 +948,16 @@ if (( finish_render_status != 0 )); then
   } >"$TTY_PATH" 2>/dev/null || true
 fi
 
+# Warm before the prompt: the removal note the finish screen shows is only
+# honest once the button press can run without the medium.
+warm_reboot_path 2>/dev/null || true
+
 if reboot_prompt; then
   if [[ ${OMARCHY_UI_AUTO_REBOOT:-} == "no" ]]; then
     exit 0
   fi
   printf '%s' "$CLEAR" >"$TTY_PATH" 2>/dev/null || true
-  reboot 2>/dev/null || systemctl reboot 2>/dev/null || true
+  release_target_and_reboot
 fi
 
 exit 0
