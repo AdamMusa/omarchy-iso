@@ -581,8 +581,8 @@ render_finish() {
 # and pre-fault the one binary the button press still runs. The medium is
 # read-only and the live logs are tmpfs, so past the umount nothing anywhere
 # is dirty, which is what makes the immediate reboot at the press clean.
-# The cost, accepted deliberately: the installed tree can no longer be
-# inspected from another tty between install and reboot.
+# Debugging keeps its access: the installed tree is no longer pre-mounted on
+# the other ttys, but one mount command away for whoever wants it.
 
 release_target() {
   local target
