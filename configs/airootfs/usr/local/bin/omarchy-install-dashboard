@@ -631,10 +631,13 @@ warm_reboot_path() {
   # (loader path, locale, runtime data) — measured on a dropped cache in the
   # live VM: timeout+ttfx 880 KiB, stty 320 KiB, gum 188 KiB, each a
   # one-time fault. Dry-running the real commands takes those reads now,
-  # while the medium is still welcome; the effect's frames go to /dev/null,
-  # so nothing shows. systemctl needs no dry run: cat+ldd covers the
-  # reboot-shaped invocation (verified via is-system-running: zero reads).
-  timeout 1s ttfx -i "$LOGO_PATH" --xterm-colors laseretch >/dev/null 2>&1 || true
+  # while the medium is still welcome. ttfx --version rather than a hidden
+  # effect run: measured to cover the effect's read set to within ~12 KiB,
+  # and it returns in milliseconds instead of burning a capped second.
+  # systemctl needs no dry run: cat+ldd covers the reboot-shaped invocation
+  # (verified via is-system-running: zero reads).
+  cat "$LOGO_PATH" >/dev/null 2>&1 || true
+  ttfx --version >/dev/null 2>&1 || true
   stty size <"$TTY_PATH" >/dev/null 2>&1 || true
   gum --version >/dev/null 2>&1 || true
 }
