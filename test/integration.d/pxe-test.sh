@@ -33,7 +33,6 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/base-test.sh"
 source "$ROOT/bin/lib/netboot.sh"
 
 TFTP_ROOT="$RUN_DIR/tftp"
-STATE=/run/omarchy-install/state.json
 
 pxe_cleanup() {
   local status=$?
@@ -106,58 +105,6 @@ assert_nbd_medium() {
     ssh_live_root "test -f /run/archiso/bootmnt/arch/x86_64/omarchy-root.btrfs"
 }
 
-wait_for_netboot_install() {
-  log "Waiting for the unattended install to finish (timeout ${INSTALL_TIMEOUT}s)"
-
-  local waited=0 text progress_name
-  while true; do
-    # An unattended install reboots on its own; the guest user's SSH
-    # answering means the installed system is up (the live environment has no
-    # such user, so no false positive from the installer phase).
-    if ssh_guest true 2>/dev/null; then
-      log "Install finished and rebooted into the installed system."
-      capture_console "success-pxe-03-first-boot"
-      return 0
-    fi
-
-    text=$(ocr_screen)
-
-    if grep -qi "Reboot Now" <<<"$text"; then
-      log "Install finished. Confirming the reboot prompt."
-      capture_console "success-pxe-02-reboot"
-      press ret
-    fi
-
-    if grep -qi "installation stopped" <<<"$text"; then
-      capture_console "failure-install-stopped"
-      ssh_live_root "cat /var/log/omarchy-install.log" >"$RUN_DIR/omarchy-install.log" 2>/dev/null || true
-      ssh_live_root "cat $STATE" >"$RUN_DIR/state.json" 2>/dev/null || true
-      echo "Install failed — logs and screenshot saved to $RUN_DIR" >&2
-      return 1
-    fi
-
-    if ! vm_running; then
-      echo "VM exited during install" >&2
-      return 1
-    fi
-
-    if ((waited >= INSTALL_TIMEOUT)); then
-      capture_console "failure-install-timeout"
-      echo "Timed out after ${INSTALL_TIMEOUT}s waiting for install" >&2
-      return 1
-    fi
-
-    if ((waited % 120 == 0)); then
-      printf -v progress_name 'success-pxe-install-progress-%04ds' "$waited"
-      capture_console "$progress_name"
-      echo "    ... installing (${waited}s)"
-    fi
-
-    sleep 10
-    ((waited += 10))
-  done
-}
-
 assert_installed_system() {
   check "installed system is reachable (not the live medium)" \
     ssh_guest "test ! -e /run/archiso"
@@ -175,6 +122,6 @@ log "Serving the ISO as NBD export 'archiso' on 127.0.0.1:$NBD_PORT"
 serve_nbd "$ISO"
 netboot_into_installer
 assert_nbd_medium
-wait_for_netboot_install
+wait_for_unattended_install pxe
 assert_installed_system
 finish

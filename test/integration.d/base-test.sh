@@ -610,6 +610,63 @@ detect_packages() {
   fi
 }
 
+# Wait out an unattended cidata install to its reboot into the installed
+# system: SSH answering as the guest user is the success signal (cidata's
+# authorized_keys enables sshd there, and the live environment has no such
+# user, so there is no false positive from the installer phase). Presses the
+# Reboot Now prompt if one appears. Screenshot names take the given prefix so
+# each caller's artifacts stay apart; on a stopped install the live system's
+# log and state are saved best-effort (root SSH may not be authorized yet).
+wait_for_unattended_install() {
+  local prefix="$1"
+  local waited=0 text progress_name
+
+  log "Waiting for the unattended install to finish (timeout ${INSTALL_TIMEOUT}s)"
+  while true; do
+    if ssh_guest true 2>/dev/null; then
+      log "Install finished and rebooted into the installed system."
+      capture_console "success-$prefix-first-boot"
+      return 0
+    fi
+
+    text=$(ocr_screen)
+
+    if grep -qi "Reboot Now" <<<"$text"; then
+      log "Install finished. Confirming the reboot prompt."
+      capture_console "success-$prefix-reboot"
+      press ret
+    fi
+
+    if grep -qi "installation stopped" <<<"$text"; then
+      capture_console "failure-$prefix-stopped"
+      ssh_live_root "cat /var/log/omarchy-install.log" >"$RUN_DIR/omarchy-install.log" 2>/dev/null || true
+      ssh_live_root "cat /run/omarchy-install/state.json" >"$RUN_DIR/state.json" 2>/dev/null || true
+      echo "Install failed — artifacts saved to $RUN_DIR" >&2
+      return 1
+    fi
+
+    if ! vm_running; then
+      echo "VM exited during install" >&2
+      return 1
+    fi
+
+    if ((waited >= INSTALL_TIMEOUT)); then
+      capture_console "failure-$prefix-timeout"
+      echo "Timed out after ${INSTALL_TIMEOUT}s waiting for install" >&2
+      return 1
+    fi
+
+    if ((waited % 120 == 0)); then
+      printf -v progress_name 'success-%s-progress-%04ds' "$prefix" "$waited"
+      capture_console "$progress_name"
+      echo "    ... installing (${waited}s)"
+    fi
+
+    sleep 10
+    ((waited += 10))
+  done
+}
+
 install_phase() {
   log "Installing $(basename "$ISO") unattended via cidata (headless)"
 
@@ -637,51 +694,7 @@ install_phase() {
     -drive "file=$CIDATA_IMG,format=raw,if=none,id=cidata" \
     -device usb-storage,drive=cidata
 
-  log "Waiting for the unattended install to finish (timeout ${INSTALL_TIMEOUT}s)"
-  local waited=0 text progress_name
-  while true; do
-    # An unattended install reboots on its own; SSH answering means the
-    # installed system is up (cidata's authorized_keys enables sshd).
-    if ssh_guest true 2>/dev/null; then
-      log "Install finished and rebooted into the installed system."
-      capture_console "success-install-first-boot"
-      break
-    fi
-
-    text=$(ocr_screen)
-
-    if grep -qi "Reboot Now" <<<"$text"; then
-      log "Install finished. Confirming the reboot prompt."
-      capture_console "success-install-reboot"
-      press ret
-    fi
-
-    if grep -qi "installation stopped" <<<"$text"; then
-      capture_console "failure-install-stopped"
-      echo "Install failed — screenshot saved to $RUN_DIR" >&2
-      return 1
-    fi
-
-    if ! vm_running; then
-      echo "VM exited during install" >&2
-      return 1
-    fi
-
-    if ((waited >= INSTALL_TIMEOUT)); then
-      capture_console "failure-install-timeout"
-      echo "Timed out after ${INSTALL_TIMEOUT}s waiting for install" >&2
-      return 1
-    fi
-
-    if ((waited % 120 == 0)); then
-      printf -v progress_name 'success-install-progress-%04ds' "$waited"
-      capture_console "$progress_name"
-      echo "    ... installing (${waited}s)"
-    fi
-
-    sleep 10
-    ((waited += 10))
-  done
+  wait_for_unattended_install install || return 1
 
   log "Installed system is up. Saving base image."
   stop_vm
