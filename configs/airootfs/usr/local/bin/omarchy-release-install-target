@@ -10,9 +10,11 @@
 # hibernation setup's swapon in the chroot lands in the shared kernel, fuser
 # then shows no process and the submounts unmount fine, yet the filesystem
 # reports busy until the swap is off. The mappers to close are read off the
-# mount table before the unmount empties it; cryptsetup itself refuses
-# anything that is not crypt or still in use, so the close attempts cannot
-# take down more than what the target held.
+# mount table before the unmount empties it, and each one's device-mapper
+# UUID must carry the CRYPT- prefix before the close is attempted —
+# cryptsetup close happily removes a non-crypt mapping (LVM, linear), so the
+# sweep is bounded by that check, not by trust in a refusal. A busy crypt
+# mapper still fails its close, and the failure is reported.
 #
 # Extra arguments name mappers to close beyond what the mount table shows:
 # a failure between luksOpen and mount leaves a mapper open with nothing
@@ -63,6 +65,12 @@ for mapper in "${mappers[@]}"; do
   while IFS= read -r mountpoint; do
     umount -R "$mountpoint" 2>/dev/null
   done < <(findmnt -rn -o TARGET -S "/dev/mapper/$mapper" 2>/dev/null)
+  # Crypt mappings only — a foreign mapper under the target (or a stale name
+  # passed as an argument) is not ours to tear down, and cryptsetup would
+  # remove it without complaint. A missing mapper falls out here too, which
+  # keeps the no-op run silent the way idempotency wants.
+  uuid=$(dmsetup info -c --noheadings -o uuid "$mapper" 2>/dev/null)
+  [[ $uuid == CRYPT-* ]] || continue
   if ! cryptsetup close "$mapper" 2>/dev/null && [[ -e /dev/mapper/$mapper ]]; then
     {
       echo "could not close mapper $mapper; holders:"
