@@ -615,16 +615,28 @@ release_target() {
 
 warm_reboot_path() {
   local binary path dep
-  # ttfx and gum, not just systemctl: the note goes up inside render_finish,
-  # so the logo effect (up to 8s of it) and the button gum paints are both
+  # Everything the post-note window still execs: the note goes up inside
+  # render_finish, so the logo effect (up to 8s of it), the timeout in front
+  # of it, the stty that sizes the prompt, and the button gum paints are all
   # still ahead of the moment the user is invited to pull the stick.
-  for binary in systemctl ttfx gum; do
+  for binary in systemctl ttfx gum timeout stty; do
     path=$(command -v "$binary" 2>/dev/null) || continue
     cat "$path" >/dev/null 2>&1 || true
     while IFS= read -r dep; do
       [[ -f $dep ]] && cat "$dep" >/dev/null 2>&1
     done < <(ldd "$path" 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^\//) print $i }')
   done
+
+  # cat+ldd alone still leaves ~1.4 MiB of exec-time reads ldd cannot list
+  # (loader path, locale, runtime data) — measured on a dropped cache in the
+  # live VM: timeout+ttfx 880 KiB, stty 320 KiB, gum 188 KiB, each a
+  # one-time fault. Dry-running the real commands takes those reads now,
+  # while the medium is still welcome; the effect's frames go to /dev/null,
+  # so nothing shows. systemctl needs no dry run: cat+ldd covers the
+  # reboot-shaped invocation (verified via is-system-running: zero reads).
+  timeout 1s ttfx -i "$LOGO_PATH" --xterm-colors laseretch >/dev/null 2>&1 || true
+  stty size <"$TTY_PATH" >/dev/null 2>&1 || true
+  gum --version >/dev/null 2>&1 || true
 }
 
 reboot_prompt() {
