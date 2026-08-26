@@ -44,6 +44,12 @@ CIDATA_IMG="$BASE_DIR/cidata.img"
 HTTP_PORT=$((SSH_PORT + 1))
 HTTP_PID=""
 
+# Scenario extensions to the network stack, appended verbatim (leading comma
+# included) to the user netdev and the NIC device: the PXE scenario adds the
+# built-in TFTP server to the former and a boot order to the latter.
+NETDEV_EXTRA=""
+NIC_EXTRA=""
+
 mkdir -p "$BASE_DIR" "$RUN_DIR"
 
 QMP_SOCK=$(mktemp -u "${TMPDIR:-/tmp}/omarchy-integration-qmp.XXXXXX.sock")
@@ -190,8 +196,8 @@ start_vm() {
     -device virtio-vga \
     -display none \
     -usb -device usb-tablet \
-    -netdev user,id=net0,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22 \
-    -device virtio-net-pci,netdev=net0 \
+    -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22$NETDEV_EXTRA" \
+    -device "virtio-net-pci,netdev=net0$NIC_EXTRA" \
     -qmp "unix:$QMP_SOCK,server,nowait" \
     -serial "file:$serial" \
     -pidfile "$PIDFILE" \
