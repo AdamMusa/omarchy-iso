@@ -28,9 +28,10 @@
 export OMARCHY_INTEGRATION_FIRMWARE=bios
 
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/base-test.sh"
+# The TFTP root and NBD export come from the same rig bin/omarchy-iso-boot-pxe
+# uses, so what this scenario proves is exactly what the hands-on tool boots.
+source "$ROOT/bin/lib/netboot.sh"
 
-NBD_PORT=10809
-NBD_PID=""
 TFTP_ROOT="$RUN_DIR/tftp"
 STATE=/run/omarchy-install/state.json
 
@@ -41,38 +42,6 @@ pxe_cleanup() {
   return $status
 }
 trap pxe_cleanup EXIT
-
-# ------------------------------------------------------------------ fixture
-
-prepare_netboot() {
-  log "Assembling the TFTP root from the ISO's own netboot files"
-  rm -rf "$TFTP_ROOT"
-  mkdir -p "$TFTP_ROOT"
-  # Only the boot trees; the airootfs and the root image stay on the ISO and
-  # travel over NBD. The ISO's read-only modes would block the glue file below.
-  bsdtar -xf "$ISO" -C "$TFTP_ROOT" boot arch/boot
-  chmod -R u+w "$TFTP_ROOT"
-
-  # PXELINUX looks for its configuration at pxelinux.cfg/default next to
-  # lpxelinux.0. Route it into the ISO's own config: its whichsys.c32 line
-  # detects PXELINUX and switches to the PXE menu.
-  mkdir -p "$TFTP_ROOT/boot/syslinux/pxelinux.cfg"
-  echo "INCLUDE syslinux.cfg" >"$TFTP_ROOT/boot/syslinux/pxelinux.cfg/default"
-}
-
-start_nbd() {
-  log "Serving the ISO as NBD export 'archiso' on 127.0.0.1:$NBD_PORT"
-  qemu-nbd --read-only --persistent --export-name=archiso \
-    --bind=127.0.0.1 --port="$NBD_PORT" "$ISO" &
-  NBD_PID=$!
-
-  sleep 1
-  if ! kill -0 "$NBD_PID" 2>/dev/null; then
-    NBD_PID=""
-    echo "qemu-nbd could not serve 127.0.0.1:$NBD_PORT (the port is fixed by nbd-client); is it already taken?" >&2
-    return 1
-  fi
-}
 
 nbd_dialed() {
   [[ -n $(ss -Htn "sport = :$NBD_PORT") ]]
@@ -200,8 +169,10 @@ assert_installed_system() {
 
 # ---------------------------------------------------------------------- main
 
-prepare_netboot
-start_nbd
+log "Assembling the TFTP root from the ISO's own netboot files"
+assemble_tftp_root "$ISO" "$TFTP_ROOT"
+log "Serving the ISO as NBD export 'archiso' on 127.0.0.1:$NBD_PORT"
+serve_nbd "$ISO"
 netboot_into_installer
 assert_nbd_medium
 wait_for_netboot_install

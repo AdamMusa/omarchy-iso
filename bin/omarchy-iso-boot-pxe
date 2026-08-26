@@ -13,11 +13,12 @@
 
 set -e
 
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib/netboot.sh"
+
 ISO=""
 REUSE=""
 SSH_PORT="${OMARCHY_VM_SSH_PORT:-2222}"
 WORK="${OMARCHY_VM_PXE_DIR:-/tmp/omarchy-pxe-boot}"
-NBD_PORT=10809 # not configurable: archiso_nbd_srv carries an address only
 EXTRA_QEMU_ARGS=()
 
 usage() {
@@ -106,32 +107,11 @@ TFTP_ROOT="$WORK/tftp"
 DISK="$WORK/disk.qcow2"
 mkdir -p "$WORK"
 
-# TFTP root: the ISO's own boot trees plus the one-line PXELINUX config
-# entry point every real deployment writes. Rebuilt when the ISO changes —
-# keyed on size+mtime, not the pathname, or rebuilding to the same
-# release/*.iso name would netboot the previous build's kernel and
-# initramfs against the new build's NBD medium.
-ISO_STAMP="$ISO $(stat -c '%s %Y' "$ISO")"
-if [[ ! -f "$TFTP_ROOT/.from-iso" || $(cat "$TFTP_ROOT/.from-iso") != "$ISO_STAMP" ]]; then
-  echo "Assembling the TFTP root from $ISO"
-  rm -rf "$TFTP_ROOT"
-  mkdir -p "$TFTP_ROOT"
-  bsdtar -xf "$ISO" -C "$TFTP_ROOT" boot arch/boot
-  chmod -R u+w "$TFTP_ROOT"
-  mkdir -p "$TFTP_ROOT/boot/syslinux/pxelinux.cfg"
-  echo "INCLUDE syslinux.cfg" >"$TFTP_ROOT/boot/syslinux/pxelinux.cfg/default"
-  echo "$ISO_STAMP" >"$TFTP_ROOT/.from-iso"
-fi
-
-if [[ -n $(ss -Htln "sport = :$NBD_PORT") ]]; then
-  echo "Port $NBD_PORT is already taken; stop whatever serves it first." >&2
-  exit 1
-fi
+echo "Assembling the TFTP root from $ISO (cached until the ISO changes)"
+assemble_tftp_root "$ISO" "$TFTP_ROOT"
 
 echo "Serving the ISO as NBD export 'archiso' on 127.0.0.1:$NBD_PORT"
-qemu-nbd --read-only --persistent --export-name=archiso \
-  --bind=127.0.0.1 --port="$NBD_PORT" "$ISO" &
-NBD_PID=$!
+serve_nbd "$ISO"
 trap 'kill $NBD_PID 2>/dev/null || true' EXIT
 
 if [[ ! -f $DISK || $REUSE != "reuse" ]]; then
