@@ -107,8 +107,12 @@ DISK="$WORK/disk.qcow2"
 mkdir -p "$WORK"
 
 # TFTP root: the ISO's own boot trees plus the one-line PXELINUX config
-# entry point every real deployment writes. Rebuilt when the ISO changes.
-if [[ ! -f "$TFTP_ROOT/.from-iso" || $(cat "$TFTP_ROOT/.from-iso") != "$ISO" ]]; then
+# entry point every real deployment writes. Rebuilt when the ISO changes —
+# keyed on size+mtime, not the pathname, or rebuilding to the same
+# release/*.iso name would netboot the previous build's kernel and
+# initramfs against the new build's NBD medium.
+ISO_STAMP="$ISO $(stat -c '%s %Y' "$ISO")"
+if [[ ! -f "$TFTP_ROOT/.from-iso" || $(cat "$TFTP_ROOT/.from-iso") != "$ISO_STAMP" ]]; then
   echo "Assembling the TFTP root from $ISO"
   rm -rf "$TFTP_ROOT"
   mkdir -p "$TFTP_ROOT"
@@ -116,7 +120,7 @@ if [[ ! -f "$TFTP_ROOT/.from-iso" || $(cat "$TFTP_ROOT/.from-iso") != "$ISO" ]];
   chmod -R u+w "$TFTP_ROOT"
   mkdir -p "$TFTP_ROOT/boot/syslinux/pxelinux.cfg"
   echo "INCLUDE syslinux.cfg" >"$TFTP_ROOT/boot/syslinux/pxelinux.cfg/default"
-  echo "$ISO" >"$TFTP_ROOT/.from-iso"
+  echo "$ISO_STAMP" >"$TFTP_ROOT/.from-iso"
 fi
 
 if [[ -n $(ss -Htln "sport = :$NBD_PORT") ]]; then
