@@ -17,6 +17,12 @@
 # the cmdline says exactly n, and both keep the server's image tree mounted,
 # so pinned they can still stream the root image. HTTP cannot -- its hook only
 # downloads the airootfs into a tmpfs -- so no entry may use archiso_http_srv.
+#
+# No entry may carry cms_verify either: these ISOs are not codesigned
+# (mkarchiso is never given a certificate), and the archiso hook aborts into
+# an emergency shell when the flag is set with no .cms.sig on the medium. The
+# releng profile the build seeds from ships it on the PXE entries, so a
+# config resync would quietly reintroduce it.
 
 set -euo pipefail
 
@@ -32,6 +38,11 @@ count=$(printf '%s\n' "$entries" | wc -l)
 
 if grep -rq archiso_http_srv configs/syslinux configs/grub configs/efiboot; then
   echo "HTTP PXE entry found: that path copies only the airootfs to RAM, so the root image is never on the medium and an install can never succeed"
+  exit 1
+fi
+
+if grep -rhE '^[^#]*cms_verify' configs/syslinux configs/grub configs/efiboot | grep -q .; then
+  echo "cms_verify found: the ISO is not codesigned, so any boot entry carrying it aborts into an emergency shell"
   exit 1
 fi
 
