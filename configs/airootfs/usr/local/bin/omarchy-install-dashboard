@@ -542,8 +542,8 @@ render_finish() {
     blank_line
     # Above the button, not below: gum clears everything under its view on
     # each repaint, so a line below the prompt would be erased. True because
-    # of warm_reboot_path + release_target_and_reboot: from here to the
-    # reboot syscall nothing reads the install medium again.
+    # of release_target + warm_reboot_path: from here to the reboot syscall
+    # nothing reads the install medium again.
     center "${DIM}You can now remove the install medium${RESET}" "$CONTENT_WIDTH"
   } >"$TTY_PATH"
 
