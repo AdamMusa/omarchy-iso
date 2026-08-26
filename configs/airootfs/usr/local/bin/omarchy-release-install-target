@@ -20,8 +20,10 @@
 # a failure between luksOpen and mount leaves a mapper open with nothing
 # mounted from it, which the table sweep cannot see.
 #
-# Idempotent: a target with nothing mounted exits 0. Exits nonzero only when
-# the tree is (still) mounted and umount -R failed.
+# Idempotent: a target with nothing mounted and no mapper left open exits 0.
+# Exits nonzero when the tree stayed mounted (umount -R failed) or a crypt
+# mapper stayed open — either way the target is not fully let go, and the
+# dashboard's removal offer and immediate-reboot choice key on exactly that.
 
 set -uo pipefail
 
@@ -61,6 +63,7 @@ fi
 # stage-mounts the same filesystem under /run/omarchy-install during some
 # phases, and a mid-phase failure can leave one behind — the close would
 # then fail silently on a device the target-tree unmount never saw.
+close_failed=0
 for mapper in "${mappers[@]}"; do
   while IFS= read -r mountpoint; do
     umount -R "$mountpoint" 2>/dev/null
@@ -77,8 +80,9 @@ for mapper in "${mappers[@]}"; do
       fuser -vm "/dev/mapper/$mapper" 2>&1
       dmsetup info "$mapper" 2>&1
     } >&2
+    close_failed=1
   fi
 done
 
 sync
-exit 0
+exit $close_failed
