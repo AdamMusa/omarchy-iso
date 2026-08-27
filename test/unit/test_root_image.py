@@ -6,8 +6,12 @@ the image can land on) and the destructive subvolume dance in _install_root_imag
 asserted on the subprocess calls against a temp target.
 """
 
+import errno
+import json
 import os
+import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
 import types
@@ -460,6 +464,101 @@ class TargetKeyringUnitTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "keyring init failed"):
                 phases_impl.create_factory_snapshot(self.ctx)
         self.assertEqual(self.runs, [])
+
+
+class ReceiveRootImageTest(unittest.TestCase):
+    """The stream-into-btrfs-receive pump, against a real child on a real pipe.
+
+    btrfs receive is stood in for by a shell that drains stdin, so the pipe
+    blocks the way the real one does and the child is only reaped when its
+    stdin is actually closed.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.state_dir = root / "state"
+        self.state_dir.mkdir()
+        (self.state_dir / "state.json").write_text("{}")
+        self.top = root / "image-top"
+        self.received = root / "received"
+        self.ctx = types.SimpleNamespace(target=root / "mnt", state_dir=self.state_dir)
+        self.procs = []
+
+    def stand_in(self, script):
+        """Patch Popen so btrfs receive is this shell script instead, keeping
+        the caller's stdin pipe and stderr file."""
+
+        spawn = subprocess.Popen  # before the patch below replaces it
+
+        def popen(cmd, **kwargs):
+            self.assertEqual(cmd[:2], ["btrfs", "receive"])
+            proc = spawn(["sh", "-c", script], **kwargs)
+            self.procs.append(proc)
+            return proc
+
+        patch = mock.patch.object(phases_impl.subprocess, "Popen", side_effect=popen)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def drains_stdin(self):
+        self.stand_in(f"cat > {shlex.quote(str(self.received))}")
+
+    def stream_file(self, data):
+        path = Path(self.tmp.name) / "omarchy-root.btrfs"
+        path.write_bytes(data)
+        return path
+
+    def test_streams_the_file_through_and_reports_done(self):
+        self.drains_stdin()
+        phases_impl._receive_root_image(self.ctx, self.top, self.stream_file(b"x" * (9 << 20)))
+
+        self.assertEqual(self.received.read_bytes(), b"x" * (9 << 20))
+        self.assertEqual(json.loads((self.state_dir / "state.json").read_text())["phase_progress"], 1.0)
+
+    def test_a_failed_receive_raises_with_its_error_output(self):
+        self.stand_in("cat > /dev/null; echo 'ERROR: chunk failed' >&2; exit 1")
+        with self.assertRaisesRegex(RuntimeError, "chunk failed"):
+            phases_impl._receive_root_image(self.ctx, self.top, self.stream_file(b"stream"))
+
+    def test_a_read_error_off_the_medium_still_closes_and_reaps_the_receive(self):
+        # EIO out of a dying stick is the failure the verify machinery exists
+        # for. If stdin were left open, btrfs receive would sit blocked on it
+        # and hold the staging mount busy for the caller's silent umount.
+        self.drains_stdin()
+        with self.assertRaises(OSError):
+            phases_impl._receive_root_image(self.ctx, self.top, DyingStream(b"y" * (9 << 20)))
+
+        proc = self.procs[0]
+        self.assertEqual(proc.wait(timeout=10), 0)
+        self.assertEqual(self.received.read_bytes(), b"y" * (8 << 20))
+
+
+class DyingStream:
+    """A stream path whose reads give one chunk and then fail like a medium
+    that has gone away mid-install."""
+
+    def __init__(self, data):
+        self.data = data
+
+    def stat(self):
+        return types.SimpleNamespace(st_size=len(self.data))
+
+    def open(self, mode):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, size):
+        if self.data:
+            chunk, self.data = self.data[:size], b""
+            return chunk
+        raise OSError(errno.EIO, "Input/output error")
 
 
 if __name__ == "__main__":

@@ -675,12 +675,35 @@ def _receive_root_image(ctx: InstallContext, top: Path, stream_path: Path) -> No
                 if now - last_report >= 0.5:
                     _write_phase_progress(ctx, sent / total if total else 1.0)
                     last_report = now
-        proc.stdin.close()
     except BrokenPipeError:
         pass
-    if proc.wait() != 0:
+    finally:
+        # Whatever happened above — including the EIO off a dying medium that
+        # the whole verify machinery exists to catch — btrfs receive must not
+        # be left blocked on an open stdin. It would hold the caller's staging
+        # mount busy, and that umount is check=False: the mount would leak onto
+        # the target filesystem with nothing said about it.
+        code = _close_receive(proc)
+    if code != 0:
         raise RuntimeError(f"btrfs receive failed: {errors.read_text(errors='replace').strip()}")
     _write_phase_progress(ctx, 1.0)
+
+
+def _close_receive(proc: subprocess.Popen) -> int:
+    """Close btrfs receive's stdin and reap it, returning its exit status.
+
+    Never raises: it runs on the way out of a failing read, where the original
+    exception is the one worth keeping. Closing flushes, so a receive that has
+    already died answers with a BrokenPipeError of its own; the wait is
+    unbounded because a receive that has read EOF is committing the subvolume,
+    which on slow media is legitimately slow and must not be killed.
+    """
+    if proc.stdin is not None:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+    return proc.wait()
 
 
 def _write_phase_progress(ctx: InstallContext, fraction: float) -> None:
