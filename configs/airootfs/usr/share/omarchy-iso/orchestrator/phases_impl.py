@@ -128,10 +128,18 @@ def _omarchy_nvim_package() -> str:
 
 # The root image: a `btrfs send --compressed-data` stream of the invariant
 # target system (build-root-image.sh), unpacked onto the target in place of
-# pacstrapping it. build-iso.sh ships it as a plain file on the ISO, read
-# straight off the boot medium, with sha256sum output for it next to it. The
-# subvolume name is what build-root-image.sh sends.
-ROOT_IMAGE_STREAM = Path("/run/archiso/bootmnt/arch/x86_64/omarchy-root.btrfs")
+# pacstrapping it, shipped behind an outer whole-stream zstd layer (the
+# per-extent compression inside the stream cannot reach the send framing or
+# redundancy that spans extents; the outer pass is ~11% of the stream).
+# build-iso.sh ships it as a plain file on the ISO, read straight off the
+# boot medium, with sha256sum output for it (the compressed file) next to it.
+# The subvolume name is what build-root-image.sh sends.
+ROOT_IMAGE_STREAM = Path("/run/archiso/bootmnt/arch/x86_64/omarchy-root.btrfs.zst")
+# Decompresses the outer layer in the receive pipe. --long=27 mirrors the
+# compressing side's window: it is within the decoder's default 128 MiB
+# acceptance limit, but saying it here keeps the pair visibly in step with
+# STREAM_COMPRESS in build-root-image.sh.
+ROOT_IMAGE_DECOMPRESS = ("zstd", "-dc", "--long=27")
 ROOT_IMAGE_SUBVOLUME = "omarchy-root"
 # The live ISO starts omarchy-root-image-verify.service at boot: `sha256sum -c`
 # of the stream, running while the user is in the configurator. It is the only
@@ -653,23 +661,43 @@ def _umount_tree(root: Path, attempts: int = 20) -> None:
 
 
 def _receive_root_image(ctx: InstallContext, top: Path, stream_path: Path) -> None:
-    """Pipe the stream into btrfs receive, publishing progress for the
-    dashboard as a fraction of stream bytes consumed."""
+    """Pipe the stream through the outer-layer decompressor into btrfs
+    receive, publishing progress for the dashboard as a fraction of stream
+    bytes consumed (compressed bytes — the fraction of the medium read, which
+    is what the wait is made of).
+
+    This loop keeps the read off the medium for itself rather than handing
+    zstd the file: a read error here is the dying-medium case the verify
+    machinery exists for, and it must surface as this process's OSError, not
+    as a decompressor exit code to reverse-engineer.
+    """
     total = stream_path.stat().st_size
     errors = ctx.state_dir / "btrfs-receive.err"
     with errors.open("w") as err:
-        proc = subprocess.Popen(
-            ["btrfs", "receive", "-q", str(top)],
+        unzstd = subprocess.Popen(
+            [*ROOT_IMAGE_DECOMPRESS],
             stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
             stderr=err,
         )
-    assert proc.stdin is not None
+        proc = subprocess.Popen(
+            ["btrfs", "receive", "-q", str(top)],
+            stdin=unzstd.stdout,
+            stderr=err,
+        )
+    assert unzstd.stdin is not None
+    assert unzstd.stdout is not None
+    # The receive holds the decoded pipe now. Dropping this copy of its read
+    # end is load-bearing: with it open, a receive that dies early would
+    # never turn zstd's writes into EPIPE, and the whole pipeline — this
+    # loop included — would block on full pipes instead of failing.
+    unzstd.stdout.close()
     sent = 0
     last_report = 0.0
     try:
         with stream_path.open("rb") as stream:
             while chunk := stream.read(8 << 20):
-                proc.stdin.write(chunk)
+                unzstd.stdin.write(chunk)
                 sent += len(chunk)
                 now = time.monotonic()
                 if now - last_report >= 0.5:
@@ -679,31 +707,37 @@ def _receive_root_image(ctx: InstallContext, top: Path, stream_path: Path) -> No
         pass
     finally:
         # Whatever happened above — including the EIO off a dying medium that
-        # the whole verify machinery exists to catch — btrfs receive must not
-        # be left blocked on an open stdin. It would hold the caller's staging
-        # mount busy, and that umount is check=False: the mount would leak onto
-        # the target filesystem with nothing said about it.
-        code = _close_receive(proc)
-    if code != 0:
-        raise RuntimeError(f"btrfs receive failed: {errors.read_text(errors='replace').strip()}")
+        # the whole verify machinery exists to catch — neither child must be
+        # left blocked on an open stdin. A blocked receive would hold the
+        # caller's staging mount busy, and that umount is check=False: the
+        # mount would leak onto the target filesystem with nothing said.
+        unzstd_code, code = _close_receive(unzstd, proc)
+    if unzstd_code != 0 or code != 0:
+        # Both children share the error file, so the full story is in the
+        # detail either way; the headline names the stage that broke the pipe.
+        stage = "btrfs receive" if code != 0 else "root image decompression"
+        raise RuntimeError(f"{stage} failed: {errors.read_text(errors='replace').strip()}")
     _write_phase_progress(ctx, 1.0)
 
 
-def _close_receive(proc: subprocess.Popen) -> int:
-    """Close btrfs receive's stdin and reap it, returning its exit status.
+def _close_receive(unzstd: subprocess.Popen, proc: subprocess.Popen) -> tuple[int, int]:
+    """Close the pipeline's intake and reap both children, returning
+    (decompressor, receive) exit statuses.
 
     Never raises: it runs on the way out of a failing read, where the original
-    exception is the one worth keeping. Closing flushes, so a receive that has
-    already died answers with a BrokenPipeError of its own; the wait is
-    unbounded because a receive that has read EOF is committing the subvolume,
-    which on slow media is legitimately slow and must not be killed.
+    exception is the one worth keeping. Closing flushes, so a decompressor
+    that has already died answers with a BrokenPipeError of its own; on EOF it
+    drains what it holds and exits, which ends the receive's stdin in turn.
+    The receive's wait is unbounded because a receive that has read EOF is
+    committing the subvolume, which on slow media is legitimately slow and
+    must not be killed.
     """
-    if proc.stdin is not None:
+    if unzstd.stdin is not None:
         try:
-            proc.stdin.close()
+            unzstd.stdin.close()
         except OSError:
             pass
-    return proc.wait()
+    return unzstd.wait(), proc.wait()
 
 
 def _write_phase_progress(ctx: InstallContext, fraction: float) -> None:

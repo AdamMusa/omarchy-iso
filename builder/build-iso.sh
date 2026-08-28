@@ -341,7 +341,7 @@ sed "/^\[options\]/a CacheDir = /var/cache/omarchy/mirror/offline/" \
 iso_subdir="$(sed -n 's/^install_dir="\(.*\)"$/\1/p' "$build_cache_dir/profiledef.sh")/$(sed -n 's/^arch="\(.*\)"$/\1/p' "$build_cache_dir/profiledef.sh")"
 [[ $iso_subdir == */x86_64 ]] || { echo "ERROR: could not read install_dir/arch from profiledef.sh: '$iso_subdir'" >&2; exit 1; }
 root_image_dir="$build_cache_dir/work/iso/$iso_subdir"
-root_image_stream="$root_image_dir/omarchy-root.btrfs"
+root_image_stream="$root_image_dir/omarchy-root.btrfs.zst"
 mkdir -p "$root_image_dir"
 # Builds before the move left the stream (and, briefly, its checksum) in the
 # persistent build cache, where they would ship inside the squashfs alongside

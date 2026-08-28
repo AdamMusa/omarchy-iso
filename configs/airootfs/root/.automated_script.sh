@@ -58,8 +58,8 @@ if [[ ${OMARCHY_INSTALL_DEBUG:-} == "1" ]]; then
 fi
 
 # Warm the page cache for the root image and bundled packages while the user
-# works through the wizard. The install streams ~5GB of root image into btrfs
-# receive and then pacstraps a few packages out of the offline mirror; on media
+# works through the wizard. The install streams a multi-GB root image into
+# btrfs receive and then pacstraps a few packages out of the offline mirror; on media
 # slower than the unpack the install is read-bound and every byte cached here
 # is a byte it never waits for. On faster media this costs nothing but
 # otherwise-idle bandwidth: the medium is untouched while the user types, and
@@ -72,7 +72,7 @@ warm_offline_mirror() {
   local mirror=/var/cache/omarchy/mirror/offline
   local budget_kb spent_kb=0 size_kb path
   # The orchestrator's ROOT_IMAGE_STREAM.
-  local image=/run/archiso/bootmnt/arch/x86_64/omarchy-root.btrfs
+  local image=/run/archiso/bootmnt/arch/x86_64/omarchy-root.btrfs.zst
 
   [[ ${OMARCHY_NO_PREFETCH:-} == 1 ]] && return 0
 

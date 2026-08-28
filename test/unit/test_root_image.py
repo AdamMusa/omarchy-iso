@@ -116,7 +116,7 @@ class VerifyRootImageStreamTest(unittest.TestCase):
     def test_corrupt_medium_raises_with_the_helpers_message(self):
         stderr = ("install medium is corrupt: re-flash it\n"
                   "sha256 mismatch on the root image\n"
-                  "omarchy-root.btrfs: FAILED")
+                  "omarchy-root.btrfs.zst: FAILED")
         with self.helper_returns(1, stdout="boot medium: /dev/sda1 ...\n", stderr=stderr):
             with self.assertRaises(RuntimeError) as raised:
                 phases_impl.verify_root_image_stream(self.ctx)
@@ -145,7 +145,7 @@ class PublishVerifyProgressTest(unittest.TestCase):
 
     def test_mirrors_hasher_read_position(self):
         with tempfile.TemporaryDirectory() as tmp:
-            stream = (Path(tmp) / "omarchy-root.btrfs").resolve()
+            stream = (Path(tmp) / "omarchy-root.btrfs.zst").resolve()
             stream.write_bytes(b"\0" * 4096)
             states = iter(["activating", "active"])
 
@@ -169,7 +169,7 @@ class PublishVerifyProgressTest(unittest.TestCase):
 
     def test_missing_stream_is_a_no_op(self):
         with mock.patch.object(phases_impl, "ROOT_IMAGE_STREAM",
-                               Path("/nonexistent/omarchy-root.btrfs")), \
+                               Path("/nonexistent/omarchy-root.btrfs.zst")), \
              mock.patch.object(phases_impl, "_verify_unit_property") as show:
             phases_impl._publish_verify_progress(ctx=None)
         show.assert_not_called()
@@ -220,7 +220,7 @@ class InstallRootImageTest(unittest.TestCase):
         self.state_dir = Path(self.tmp.name) / "state"
         self.state_dir.mkdir()
         self.top = self.state_dir / "image-top"
-        self.stream = Path(self.tmp.name) / "omarchy-root.btrfs"
+        self.stream = Path(self.tmp.name) / "omarchy-root.btrfs.zst"
         self.stream.write_bytes(b"stream")
         self.ctx = types.SimpleNamespace(target=self.target, state_dir=self.state_dir)
 
@@ -467,11 +467,13 @@ class TargetKeyringUnitTest(unittest.TestCase):
 
 
 class ReceiveRootImageTest(unittest.TestCase):
-    """The stream-into-btrfs-receive pump, against a real child on a real pipe.
+    """The stream-through-zstd-into-btrfs-receive pump, against real children
+    on real pipes.
 
-    btrfs receive is stood in for by a shell that drains stdin, so the pipe
-    blocks the way the real one does and the child is only reaped when its
-    stdin is actually closed.
+    The decompressor is the real zstd on real fixture streams; btrfs receive
+    is stood in for by a shell that drains stdin, so its pipe blocks the way
+    the real one does and the child is only reaped when its stdin actually
+    reaches EOF (which now takes the decompressor exiting first).
     """
 
     def setUp(self):
@@ -488,11 +490,17 @@ class ReceiveRootImageTest(unittest.TestCase):
 
     def stand_in(self, script):
         """Patch Popen so btrfs receive is this shell script instead, keeping
-        the caller's stdin pipe and stderr file."""
+        the caller's pipes and stderr file. The zstd child spawns for real.
+
+        Fixtures must be built before this arms: subprocess.run resolves
+        Popen through the patched module attribute too.
+        """
 
         spawn = subprocess.Popen  # before the patch below replaces it
 
         def popen(cmd, **kwargs):
+            if cmd[0] == "zstd":
+                return spawn(cmd, **kwargs)
             self.assertEqual(cmd[:2], ["btrfs", "receive"])
             proc = spawn(["sh", "-c", script], **kwargs)
             self.procs.append(proc)
@@ -505,34 +513,71 @@ class ReceiveRootImageTest(unittest.TestCase):
     def drains_stdin(self):
         self.stand_in(f"cat > {shlex.quote(str(self.received))}")
 
-    def stream_file(self, data):
-        path = Path(self.tmp.name) / "omarchy-root.btrfs"
-        path.write_bytes(data)
+    def compressed(self, data):
+        return subprocess.run(
+            ["zstd", "-q", "-c", "--long=27"], input=data,
+            stdout=subprocess.PIPE, check=True,
+        ).stdout
+
+    def stream_file(self, data, raw=False):
+        """The shipped artifact: DATA behind the outer zstd layer (or, with
+        raw=True, a file that never was a zstd stream)."""
+        path = Path(self.tmp.name) / "omarchy-root.btrfs.zst"
+        path.write_bytes(data if raw else self.compressed(data))
         return path
 
     def test_streams_the_file_through_and_reports_done(self):
+        stream = self.stream_file(b"x" * (9 << 20))
         self.drains_stdin()
-        phases_impl._receive_root_image(self.ctx, self.top, self.stream_file(b"x" * (9 << 20)))
+        phases_impl._receive_root_image(self.ctx, self.top, stream)
 
         self.assertEqual(self.received.read_bytes(), b"x" * (9 << 20))
         self.assertEqual(json.loads((self.state_dir / "state.json").read_text())["phase_progress"], 1.0)
 
     def test_a_failed_receive_raises_with_its_error_output(self):
+        stream = self.stream_file(b"stream")
         self.stand_in("cat > /dev/null; echo 'ERROR: chunk failed' >&2; exit 1")
-        with self.assertRaisesRegex(RuntimeError, "chunk failed"):
-            phases_impl._receive_root_image(self.ctx, self.top, self.stream_file(b"stream"))
+        with self.assertRaisesRegex(RuntimeError, "btrfs receive failed.*chunk failed"):
+            phases_impl._receive_root_image(self.ctx, self.top, stream)
+
+    def test_a_receive_that_dies_at_once_fails_instead_of_blocking(self):
+        # With the parent still holding a read end of the decoded pipe, a
+        # dead receive would never EPIPE the decompressor and the pump would
+        # block on full pipes forever. The payload outsizes every buffer in
+        # the pipeline so that hang is reachable.
+        stream = self.stream_file(b"x" * (9 << 20))
+        self.stand_in("exit 1")
+        with self.assertRaisesRegex(RuntimeError, "btrfs receive failed"):
+            phases_impl._receive_root_image(self.ctx, self.top, stream)
+
+    def test_a_corrupt_outer_layer_fails_as_decompression(self):
+        # The boot-time hash normally rejects this first; the pipe is the
+        # backstop when the medium rots between hash and receive.
+        stream = self.stream_file(b"not a zstd frame at all", raw=True)
+        self.drains_stdin()
+        with self.assertRaisesRegex(RuntimeError, "decompression failed"):
+            phases_impl._receive_root_image(self.ctx, self.top, stream)
+        self.assertEqual(self.procs[0].wait(timeout=10), 0)
 
     def test_a_read_error_off_the_medium_still_closes_and_reaps_the_receive(self):
         # EIO out of a dying stick is the failure the verify machinery exists
-        # for. If stdin were left open, btrfs receive would sit blocked on it
-        # and hold the staging mount busy for the caller's silent umount.
+        # for. If stdin were left open, the zstd child would sit blocked on it
+        # — and btrfs receive behind it — holding the staging mount busy for
+        # the caller's silent umount. Random payload so the compressed stream
+        # outgrows the 8 MiB first chunk and the EIO lands mid-stream.
+        payload = os.urandom(12 << 20)
+        stream = DyingStream(self.compressed(payload))
         self.drains_stdin()
         with self.assertRaises(OSError):
-            phases_impl._receive_root_image(self.ctx, self.top, DyingStream(b"y" * (9 << 20)))
+            phases_impl._receive_root_image(self.ctx, self.top, stream)
 
         proc = self.procs[0]
         self.assertEqual(proc.wait(timeout=10), 0)
-        self.assertEqual(self.received.read_bytes(), b"y" * (8 << 20))
+        received = self.received.read_bytes()
+        # What made it through is a flushed prefix of the payload: the
+        # truncated tail died in the decompressor, not in the receive.
+        self.assertTrue(payload.startswith(received))
+        self.assertLess(len(received), len(payload))
 
 
 class DyingStream:
