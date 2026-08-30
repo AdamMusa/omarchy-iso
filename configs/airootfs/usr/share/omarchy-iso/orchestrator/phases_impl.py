@@ -680,11 +680,28 @@ def _receive_root_image(ctx: InstallContext, top: Path, stream_path: Path) -> No
             stdout=subprocess.PIPE,
             stderr=err,
         )
-        proc = subprocess.Popen(
-            ["btrfs", "receive", "-q", str(top)],
-            stdin=unzstd.stdout,
-            stderr=err,
-        )
+        try:
+            proc = subprocess.Popen(
+                ["btrfs", "receive", "-q", str(top)],
+                stdin=unzstd.stdout,
+                stderr=err,
+            )
+        except Exception:
+            # A half-built pipeline has no receive to drain the decompressor,
+            # and _close_receive below never runs: close both of its pipes so
+            # it exits (EOF on stdin; EPIPE once its output has nowhere to
+            # go) and reap it, then let the original exception tell the
+            # story. btrfs is on every live ISO, so this is close to
+            # unreachable -- but a leaked child blocked on stdin is the kind
+            # of close-to that turns a loud failure into a wedged teardown.
+            for pipe in (unzstd.stdin, unzstd.stdout):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
+            unzstd.wait()
+            raise
     assert unzstd.stdin is not None
     assert unzstd.stdout is not None
     # The receive holds the decoded pipe now. Dropping this copy of its read
@@ -714,8 +731,18 @@ def _receive_root_image(ctx: InstallContext, top: Path, stream_path: Path) -> No
         unzstd_code, code = _close_receive(unzstd, proc)
     if unzstd_code != 0 or code != 0:
         # Both children share the error file, so the full story is in the
-        # detail either way; the headline names the stage that broke the pipe.
-        stage = "btrfs receive" if code != 0 else "root image decompression"
+        # detail either way. When both fail, the order of death is not
+        # knowable from exit codes alone -- a corrupt outer layer kills zstd
+        # and starves the receive, while a dead receive EPIPEs zstd -- so
+        # the headline names both instead of guessing a culprit, and the
+        # detail (zstd's "premature end", the receive's own complaint)
+        # disambiguates.
+        if unzstd_code != 0 and code != 0:
+            stage = "root image decompression and btrfs receive both"
+        elif code != 0:
+            stage = "btrfs receive"
+        else:
+            stage = "root image decompression"
         raise RuntimeError(f"{stage} failed: {errors.read_text(errors='replace').strip()}")
     _write_phase_progress(ctx, 1.0)
 

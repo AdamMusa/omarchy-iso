@@ -544,11 +544,48 @@ class ReceiveRootImageTest(unittest.TestCase):
         # With the parent still holding a read end of the decoded pipe, a
         # dead receive would never EPIPE the decompressor and the pump would
         # block on full pipes forever. The payload outsizes every buffer in
-        # the pipeline so that hang is reachable.
+        # the pipeline so that hang is reachable. The EPIPE takes the
+        # decompressor down too, so the headline names both.
         stream = self.stream_file(b"x" * (9 << 20))
         self.stand_in("exit 1")
-        with self.assertRaisesRegex(RuntimeError, "btrfs receive failed"):
+        with self.assertRaisesRegex(RuntimeError, "decompression and btrfs receive both failed"):
             phases_impl._receive_root_image(self.ctx, self.top, stream)
+
+    def test_a_corrupt_layer_with_a_failing_receive_names_both(self):
+        # The corrupt-medium shape the headline used to get backwards: zstd
+        # dies on the junk, the starved receive exits nonzero after it, and
+        # the message blamed the receive alone. Neither death order is
+        # provable from exit codes, so both are named and the shared detail
+        # file carries zstd's own verdict.
+        stream = self.stream_file(b"junk that is no zstd frame", raw=True)
+        self.stand_in("cat > /dev/null; exit 1")
+        with self.assertRaisesRegex(RuntimeError, "decompression and btrfs receive both failed"):
+            phases_impl._receive_root_image(self.ctx, self.top, stream)
+
+    def test_a_receive_that_cannot_spawn_reaps_the_decompressor(self):
+        # The half-built pipeline: on the live ISO btrfs-progs is guaranteed,
+        # so a receive that cannot spawn is close to unreachable -- but a
+        # decompressor left alive and blocked on a stdin nobody will ever
+        # feed turns that loud failure into a wedged teardown.
+        stream = self.stream_file(b"x" * (9 << 20))
+        spawn = subprocess.Popen
+        zstd_procs = []
+
+        def popen(cmd, **kwargs):
+            if cmd[0] == "zstd":
+                proc = spawn(cmd, **kwargs)
+                zstd_procs.append(proc)
+                return proc
+            raise FileNotFoundError("btrfs")
+
+        patch = mock.patch.object(phases_impl.subprocess, "Popen", side_effect=popen)
+        patch.start()
+        self.addCleanup(patch.stop)
+        with self.assertRaises(FileNotFoundError):
+            phases_impl._receive_root_image(self.ctx, self.top, stream)
+
+        (zstd,) = zstd_procs
+        self.assertIsNotNone(zstd.poll())
 
     def test_a_corrupt_outer_layer_fails_as_decompression(self):
         # The boot-time hash normally rejects this first; the pipe is the
