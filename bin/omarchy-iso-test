@@ -18,9 +18,10 @@
 #                      first boot runs omarchy-provision-owner and creates it there
 #   --reuse-base       Skip the install phase if a base image already exists
 #   --install-only     Stop after producing the installed base image
-#   --sync-omarchy DIR Push DIR's test/acceptance into the guest before running
+#   --sync-omarchy DIR Push DIR's test suite into the guest before running
 #                      (defaults to OMARCHY_PATH when the suite is present)
 #   --sync-all DIR     Push all of DIR (bin/config/shell/test) into the guest
+#                      and also run the CLI and shell suites there
 #   --port PORT        Host port forwarded to guest SSH (default 2222)
 #   --memory MB        VM memory (default 8192)
 #   --timeout SECS     Install timeout (default 2400)
@@ -1067,16 +1068,13 @@ sync_omarchy() {
     log "Syncing $SYNC_DIR into the guest"
     tar -C "$SYNC_DIR" --exclude .git -cf - . | ssh_guest "mkdir -p $target && tar -C $target -xf -"
   else
-    log "Syncing $SYNC_DIR/test/acceptance into the guest"
-    tar -C "$SYNC_DIR/test" -cf - acceptance acceptance.d | ssh_guest "mkdir -p $target/test && tar -C $target/test -xf -"
+    log "Syncing $SYNC_DIR/test into the guest"
+    tar -C "$SYNC_DIR" -cf - test | ssh_guest "mkdir -p $target && tar -C $target -xf -"
   fi
 }
 
 acceptance_phase() {
   log "Booting acceptance VM from base image overlay"
-
-  local guest_omarchy_path="/usr/share/omarchy"
-  $SYNC_ALL && guest_omarchy_path=".local/share/omarchy"
 
   qemu-img create -f qcow2 -b "$BASE_DISK" -F qcow2 "$RUN_DIR/run.qcow2" >/dev/null
   start_vm "$RUN_DIR/run.qcow2" "$RUN_DIR/serial.log"
@@ -1087,8 +1085,19 @@ acceptance_phase() {
   local status=0
   shortcut_smoke_phase || status=1
 
+  # The synced tree is a full checkout under --sync-all; run the host-style
+  # CLI and shell suites in the guest too before the graphical acceptance
+  # run. They derive their root from their own location in the synced tree.
+  if $SYNC_ALL; then
+    log "Running CLI and shell suites in the guest"
+    ssh_guest "bash .local/share/omarchy/test/all" || status=$?
+  fi
+
+  # The product under test is always the installed tree — VM runs verify the
+  # finished product, never a dev-linked checkout.
   log "Running acceptance suite"
-  ssh_guest "OMARCHY_PATH=$guest_omarchy_path OMARCHY_ACCEPTANCE_DIR=/tmp/omarchy-acceptance bash .local/share/omarchy/test/acceptance" || status=$?
+  ssh_guest "OMARCHY_PATH=/usr/share/omarchy OMARCHY_ACCEPTANCE_DIR=/tmp/omarchy-acceptance \
+    OMARCHY_ACCEPTANCE_SUDO_PASSWORD=$GUEST_PASSWORD bash .local/share/omarchy/test/acceptance" || status=$?
 
   log "Collecting artifacts into $RUN_DIR"
   ssh_guest "tar -C /tmp -cf - omarchy-acceptance 2>/dev/null" | tar -C "$RUN_DIR" -xf - || true
