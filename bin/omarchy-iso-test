@@ -631,7 +631,11 @@ drive_configurator() {
     capture_console "success-installer-04-prepare-disk-warning-encrypted"
     if ! $ENCRYPT; then
       press ctrl-c
-      wait_for_screen "without encryption" 30
+      # The toggled confirm ("Yes, install without encryption") is a highlighted
+      # button OCR cannot read, so don't wait for it. A failed toggle still
+      # surfaces: the encrypted install stalls at the LUKS prompt on first boot
+      # and SSH never comes up.
+      sleep 2
       capture_console "success-installer-05-prepare-disk-warning-unencrypted"
     fi
     press ret
@@ -695,7 +699,11 @@ drive_configurator() {
   capture_console "success-installer-12-disk-warning-encrypted"
   if ! $ENCRYPT; then
     press ctrl-c # toggles the confirm to the unencrypted flow
-    wait_for_screen "without encryption" 30
+    # The toggled confirm ("Yes, install without encryption") is a highlighted
+    # button OCR cannot read, so don't wait for it. A failed toggle still
+    # surfaces: the encrypted install stalls at the LUKS prompt on first boot
+    # and SSH never comes up.
+    sleep 2
     capture_console "success-installer-13-disk-warning-unencrypted"
   fi
   press ret
