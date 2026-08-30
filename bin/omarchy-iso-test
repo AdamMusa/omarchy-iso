@@ -202,6 +202,11 @@ start_vm() {
   local disk="$1" serial="$2"
   shift 2
 
+  # A viewer that resizes the guest display breaks the console driving: OCR
+  # cannot read the shrunken font, and a resize during early boot can wedge
+  # virtio-gpu before the system comes up.
+  log "Watch (do not resize): vncviewer -RemoteResize=0 127.0.0.1:5905"
+
   qemu-system-x86_64 \
     -cpu host -enable-kvm -machine q35,accel=kvm \
     -smp "$(nproc)" \
@@ -885,40 +890,39 @@ EOF
   (cd "$BASE_DIR/www" && exec python3 -m http.server "$HTTP_PORT" --bind 127.0.0.1 >/dev/null 2>&1) &
   HTTP_PID=$!
 
-  local waited=0
-  while true; do
+  # Type the login blind: a VNC viewer that resizes the framebuffer makes the
+  # console font unreadable to OCR, and the real gate is SSH coming up anyway.
+  # Getty re-prompts after a failed login, so a whole-sequence retry recovers
+  # from typing before the prompt was ready.
+  sleep 15 # give first boot time to reach getty
+  local attempt
+  for attempt in 1 2 3; do
     press ctrl-alt-f3
+    sleep 8
+    press ret # settle a half-typed prompt from a previous attempt
+    sleep 2
+    type_text "$GUEST_USER"
+    capture_console "success-first-boot-03-console-username"
+    press ret
+    sleep 3
+    type_text "$GUEST_PASSWORD"
+    press ret
     sleep 4
-    ocr_screen | grep -qi "login:" && break
-    ((waited += 8))
+    type_text "curl -fsS http://10.0.2.2:$HTTP_PORT/bootstrap -o /tmp/bs && bash /tmp/bs"
+    capture_console "success-first-boot-05-bootstrap-command"
+    press ret
 
-    if ((waited >= 300)); then
-      capture_console "failure-first-boot-console-timeout"
-      echo "Timed out waiting for a console login prompt" >&2
-      return 1
+    if wait_for_ssh 120 "failure-first-boot-ssh-timeout-$attempt"; then
+      capture_console "success-first-boot-06-bootstrap-complete"
+      kill "$HTTP_PID" 2>/dev/null || true
+      HTTP_PID=""
+      press ctrl-alt-f1
+      return 0
     fi
-    sleep 4
   done
 
-  type_text "$GUEST_USER"
-  capture_console "success-first-boot-03-console-username"
-  press ret
-  wait_for_screen "Password" 60
-  type_text "$GUEST_PASSWORD"
-  capture_console "success-first-boot-04-console-password"
-  press ret
-  sleep 3
-
-  type_text "curl -fsS http://10.0.2.2:$HTTP_PORT/bootstrap -o /tmp/bs && bash /tmp/bs"
-  capture_console "success-first-boot-05-bootstrap-command"
-  press ret
-
-  wait_for_ssh 360 "failure-first-boot-ssh-timeout"
-  capture_console "success-first-boot-06-bootstrap-complete"
-
-  kill "$HTTP_PID" 2>/dev/null || true
-  HTTP_PID=""
-  press ctrl-alt-f1
+  echo "Console bootstrap did not produce SSH access after 3 attempts" >&2
+  return 1
 }
 
 # Get a freshly booted system to a running Hyprland session, typing at the
