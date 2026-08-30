@@ -42,6 +42,14 @@ if [[ -z "${BUILD_VERSION-}" ]]; then
   exit 1
 fi
 
+# A version that already numbers its candidate (4.0.2rc2) is the complete
+# artifact name; the bare -rc suffix exists only for an unnumbered candidate.
+# Without this, every candidate of a train uploads over the same
+# omarchy-X.Y.Z-rc.iso and testers cannot tell which rc they are holding.
+if [[ $BUILD_VERSION == *rc* ]]; then
+  RELEASE_SUFFIX=""
+fi
+
 BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 BUILD_RELEASE_PATH="$BUILD_ROOT/release"
 
