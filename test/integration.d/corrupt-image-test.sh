@@ -3,14 +3,15 @@
 # A corrupt install medium is refused before the disk is touched. The root
 # image ships on the ISO with its sha256 beside it; omarchy-root-image-verify
 # checks it at boot and the installer's pre-flight phase takes that verdict.
-# Flip one digit of the recorded checksum on a copy of the ISO (so the hash
-# of the image no longer matches what the medium claims — the same verdict a
-# badly flashed stick's damaged image produces), autoinstall from it, and
-# assert: the unit fails, the install halts in "Preparing install target"
-# telling the user to re-flash, nothing after that phase ran, and the target
-# disk still has no partition table. (That the verify truly reads the whole
-# multi-GB image is the slow-medium scenario's business, where the read is
-# what is being timed.)
+# Flip one byte inside the image stream on a copy of the ISO (a badly
+# flashed stick's damage, for real), autoinstall from it, and assert: the
+# unit fails, the install halts in "Preparing install target" telling the
+# user to re-flash, nothing after that phase ran, and the target disk still
+# has no partition table. Damaging the artifact rather than the recorded
+# digest also proves the digest covers the bytes that ship: a build hashing
+# the wrong or a stale file could not pass here. (That the verify truly
+# reads the whole multi-GB image is the slow-medium scenario's business,
+# where the read is what is being timed.)
 #
 # Boots the ISO itself, not the installed base image, so it needs no base.
 
@@ -23,27 +24,41 @@ STATE=/run/omarchy-install/state.json
 
 # ------------------------------------------------------------------ fixture
 
-# A copy of the ISO with one hex digit of the recorded sha256 flipped.
-# ISO9660 carries no per-file integrity data, so patching in place leaves
-# everything else on the medium intact (cp --reflink makes the copy free on
-# btrfs). The 64-char digest is plain ASCII and unique on the ISO, so plain
-# grep -F finds the checksum file's bytes; the flip stays within the hex
-# alphabet so sha256sum reports a clean FAILED, not a format complaint.
+# A copy of the ISO with one byte flipped inside the root image stream
+# itself. ISO9660 files are contiguous extents with no per-file integrity
+# data, so patching in place leaves everything else on the medium intact
+# (cp --reflink makes the copy free on btrfs).
+#
+# The stream's extent comes from the ISO9660 directory records themselves:
+# xorriso reports the file's start LBA and byte size, so the flip is placed
+# by filesystem metadata, not by searching for content (the zstd frame
+# magic opens every mirror package and countless squashfs blocks on this
+# ISO, so a content search would need fingerprinting games). ISO9660 files
+# are single contiguous extents, which is what makes lba*2048 + offset a
+# byte address inside this file and no other.
 corrupt_iso() {
-  local digest flip start
+  local lba size start off orig flipped
 
-  digest=$(bsdtar -xOf "$ISO" "$STREAM.sha256" | awk '{print $1}')
-  [[ $digest =~ ^[0-9a-f]{64}$ ]] || { echo "no recorded sha256 for $STREAM on the ISO" >&2; return 1; }
-  [[ ${digest:0:1} == 0 ]] && flip=1 || flip=0
-
-  log "Copying the ISO and mis-recording the root image's checksum"
+  log "Copying the ISO and corrupting one byte inside the root image stream"
   rm -f "$CORRUPT_ISO"
   cp --reflink=auto "$ISO" "$CORRUPT_ISO"
-  start=$(grep -Fboa -m1 -- "$digest" "$CORRUPT_ISO" | cut -d: -f1 || true)
-  [[ -n $start ]] || { echo "recorded checksum not found in the ISO image" >&2; return 1; }
 
-  printf '%s' "$flip" | dd of="$CORRUPT_ISO" bs=1 seek="$start" conv=notrunc status=none
-  log "Recorded sha256 flipped: ${digest:0:8}... now reads ${flip}${digest:1:7}..."
+  # "File data lba:  xt , startlba , blocks , filesize , path"
+  read -r lba size < <(xorriso -indev "$ISO" -find "/$STREAM" -exec report_lba 2>/dev/null |
+    awk -F, '/File data lba/ { gsub(/ /, ""); print $2, $4 }')
+  [[ $lba =~ ^[0-9]+$ && $size =~ ^[0-9]+$ ]] ||
+    { echo "xorriso could not report the extent of $STREAM" >&2; return 1; }
+  start=$((lba * 2048))
+
+  # Deep enough to model bit-rot in the payload, and provably inside the
+  # file's extent; +1 mod 256 so the byte always changes.
+  off=$((start + 1048576))
+  ((1048576 < size)) || { echo "stream unexpectedly small: $size bytes" >&2; return 1; }
+  orig=$(dd if="$CORRUPT_ISO" bs=1 skip="$off" count=1 status=none | od -An -tu1 | tr -d ' ')
+  flipped=$(( (orig + 1) % 256 ))
+  printf "\\$(printf '%03o' "$flipped")" |
+    dd of="$CORRUPT_ISO" bs=1 seek="$off" conv=notrunc status=none
+  log "Stream extent at LBA $lba ($size bytes); byte at ISO offset $off flipped ($orig -> $flipped)"
 }
 
 # -------------------------------------------------------------------- phases
