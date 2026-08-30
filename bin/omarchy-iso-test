@@ -211,6 +211,7 @@ start_vm() {
     -device virtio-blk-pci,drive=drive0,bootindex=1 \
     -device virtio-vga \
     -display none \
+    -vnc 127.0.0.1:5 \
     -usb -device usb-tablet \
     -netdev user,id=net0,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22 \
     -device virtio-net-pci,netdev=net0 \
