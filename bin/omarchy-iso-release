@@ -1,5 +1,10 @@
 #!/bin/bash
 
+# A failed step must stop the release: without this, a make that dies (say,
+# docker permission denied) falls through to signing and uploading whatever
+# stale ISO release/ already holds, under the new release's name.
+set -e
+
 MAKE_ARGS=()
 ISO_REF=quattro
 RELEASE_SUFFIX=""
