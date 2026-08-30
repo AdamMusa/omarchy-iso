@@ -75,3 +75,9 @@ fi
 echo -e "\e[32mSHA256 for $ISO_REF ISO: $iso_sha\e[0m"
 
 omarchy-iso-upload "$release_iso"
+
+# The whole point of a release is handing someone this pair.
+echo -e "\e[32mReleased $ISO_REF ISO $BUILD_VERSION\e[0m"
+echo "  URL:    https://iso.omarchy.org/${release_iso##*/}"
+echo "  SHA256: $iso_sha"
+echo "  Local:  $release_iso"
