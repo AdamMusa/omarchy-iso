@@ -8,10 +8,13 @@
 # unit fails, the install halts in "Preparing install target" telling the
 # user to re-flash, nothing after that phase ran, and the target disk still
 # has no partition table. Damaging the artifact rather than the recorded
-# digest also proves the digest covers the bytes that ship: a build hashing
-# the wrong or a stale file could not pass here. (That the verify truly
-# reads the whole multi-GB image is the slow-medium scenario's business,
-# where the read is what is being timed.)
+# digest proves the digest is sensitive to the shipped bytes at that
+# offset; the fixture separately proves the pristine stream matches its
+# recorded digest host-side, so a build hashing the wrong or a stale file
+# fails even in --reuse-base and standalone runs, where no install ever
+# boots the untouched ISO. (That the verify truly reads the whole multi-GB
+# image is the slow-medium scenario's business, where the read is what is
+# being timed.)
 #
 # Boots the ISO itself, not the installed base image, so it needs no base.
 
@@ -44,11 +47,29 @@ corrupt_iso() {
   cp --reflink=auto "$ISO" "$CORRUPT_ISO"
 
   # "File data lba:  xt , startlba , blocks , filesize , path"
+  # || true: under set -e a read off an empty pipe would kill the scenario
+  # before the guard below could say what went wrong.
   read -r lba size < <(xorriso -indev "$ISO" -find "/$STREAM" -exec report_lba 2>/dev/null |
-    awk -F, '/File data lba/ { gsub(/ /, ""); print $2, $4 }')
-  [[ $lba =~ ^[0-9]+$ && $size =~ ^[0-9]+$ ]] ||
+    awk -F, '/File data lba/ { gsub(/ /, ""); print $2, $4 }') || true
+  [[ ${lba:-} =~ ^[0-9]+$ && ${size:-} =~ ^[0-9]+$ ]] ||
     { echo "xorriso could not report the extent of $STREAM" >&2; return 1; }
   start=$((lba * 2048))
+
+  # Before damaging anything, prove the pristine artifact verifies: the
+  # digest recorded at build time must match the bytes that ship, computed
+  # here over the extent just located. Every booted install checks this
+  # implicitly, but --reuse-base skips the install and this scenario runs
+  # standalone, and in those modes nothing else would catch a build that
+  # hashed the wrong or a stale file.
+  local recorded computed
+  recorded=$(xorriso -osirrox on -indev "$ISO" -extract "/$STREAM.sha256" "$BASE_DIR/stream.sha256" 2>/dev/null &&
+    awk '{print $1; exit}' "$BASE_DIR/stream.sha256") || true
+  [[ ${recorded:-} =~ ^[0-9a-f]{64}$ ]] ||
+    { echo "could not read the recorded digest for $STREAM" >&2; return 1; }
+  computed=$(dd if="$ISO" bs=1M iflag=skip_bytes,count_bytes skip="$start" count="$size" status=none | sha256sum | cut -d' ' -f1)
+  [[ $computed == "$recorded" ]] ||
+    { echo "pristine image does not match its recorded digest (recorded ${recorded:0:8}..., shipped ${computed:0:8}...)" >&2; return 1; }
+  log "Pristine stream matches its recorded digest (${recorded:0:8}...)"
 
   # Deep enough to model bit-rot in the payload, and provably inside the
   # file's extent; +1 mod 256 so the byte always changes.
