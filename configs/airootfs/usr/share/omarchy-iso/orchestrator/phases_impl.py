@@ -686,7 +686,7 @@ def _receive_root_image(ctx: InstallContext, top: Path, stream_path: Path) -> No
                 stdin=unzstd.stdout,
                 stderr=err,
             )
-        except Exception:
+        except BaseException:
             # A half-built pipeline has no receive to drain the decompressor,
             # and _close_receive below never runs: close both of its pipes so
             # it exits (EOF on stdin; EPIPE once its output has nowhere to
@@ -694,6 +694,9 @@ def _receive_root_image(ctx: InstallContext, top: Path, stream_path: Path) -> No
             # story. btrfs is on every live ISO, so this is close to
             # unreachable -- but a leaked child blocked on stdin is the kind
             # of close-to that turns a loud failure into a wedged teardown.
+            # BaseException, not Exception: a KeyboardInterrupt aimed at this
+            # process alone must run the same cleanup on its way out (the
+            # block re-raises, so nothing is swallowed).
             for pipe in (unzstd.stdin, unzstd.stdout):
                 if pipe is not None:
                     try:

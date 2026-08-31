@@ -587,6 +587,32 @@ class ReceiveRootImageTest(unittest.TestCase):
         (zstd,) = zstd_procs
         self.assertIsNotNone(zstd.poll())
 
+    def test_an_interrupt_during_spawn_reaps_the_decompressor_too(self):
+        # A KeyboardInterrupt aimed at this process alone (not the process
+        # group, which reaches zstd directly) lands wherever the interpreter
+        # happens to be -- including inside the second Popen. It is a
+        # BaseException, so an `except Exception` would skip the cleanup and
+        # leak the blocked decompressor while the orchestrator unwinds.
+        stream = self.stream_file(b"x" * (9 << 20))
+        spawn = subprocess.Popen
+        zstd_procs = []
+
+        def popen(cmd, **kwargs):
+            if cmd[0] == "zstd":
+                proc = spawn(cmd, **kwargs)
+                zstd_procs.append(proc)
+                return proc
+            raise KeyboardInterrupt
+
+        patch = mock.patch.object(phases_impl.subprocess, "Popen", side_effect=popen)
+        patch.start()
+        self.addCleanup(patch.stop)
+        with self.assertRaises(KeyboardInterrupt):
+            phases_impl._receive_root_image(self.ctx, self.top, stream)
+
+        (zstd,) = zstd_procs
+        self.assertIsNotNone(zstd.poll())
+
     def test_a_corrupt_outer_layer_fails_as_decompression(self):
         # The boot-time hash normally rejects this first; the pipe is the
         # backstop when the medium rots between hash and receive.
