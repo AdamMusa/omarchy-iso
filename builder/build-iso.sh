@@ -30,7 +30,7 @@ pacman --noconfirm -Sy archlinux-keyring
 # so this container can be months behind the mirror it installs from. A plain
 # -Sy install is then a partial upgrade — new packages linked against a glibc
 # the container doesn't have yet.
-pacman --noconfirm -Syu archiso git sudo base-devel jq grub imagemagick neovim nodejs npm tree-sitter-cli btrfs-progs
+pacman --noconfirm -Syu archiso git sudo base-devel jq grub imagemagick neovim nodejs npm tree-sitter-cli btrfs-progs qemu-img
 
 # Pre-import the omarchy signing key (so pacman trusts our [omarchy] repo
 # during the build without keyserver lookups).
@@ -126,7 +126,7 @@ cp "/tmp/$NODE_FILENAME" "$build_cache_dir/airootfs/opt/packages/"
 # The selected omarchy-settings package is needed here so its post_install hook
 # drops Omarchy's plymouthd.conf into /etc/plymouth before mkarchiso builds the
 # live initramfs.
-arch_packages=(linux-t2 git gum jq openssl plymouth ttfx tzupdate omarchy-keyring "$OMARCHY_SETTINGS_PACKAGE" lvm2 cryptsetup parted)
+arch_packages=(linux-t2 git gum jq openssl plymouth ttfx tzupdate omarchy-keyring "$OMARCHY_SETTINGS_PACKAGE" lvm2 cryptsetup parted qemu-img)
 printf '%s\n' "${arch_packages[@]}" >> "$build_cache_dir/packages.x86_64"
 
 # The live ISO boots linux-t2 (see airootfs/etc/mkinitcpio.d/linux-t2.preset), so
@@ -307,8 +307,11 @@ rebuild_offline_repo_db
 # Packages that differ per machine and therefore stay out of the root image:
 # the installer pacstraps them on the target after unpacking the image, and
 # omarchy-apply-system installs more from omarchy-other.packages as the
-# hardware dictates. Everything else the target gets is in the image.
-hardware_packages=(linux linux-t2 amd-ucode intel-ucode sof-firmware alsa-firmware tailscale)
+# hardware dictates. The stock linux kernel is the normal configurator choice,
+# so baking it into the image avoids extracting the same package in almost
+# every install; a T2 choice still installs linux-t2 as its delta. Everything
+# else the target gets is in the image.
+hardware_packages=(linux-t2 amd-ucode intel-ucode sof-firmware alsa-firmware tailscale)
 
 mapfile -t image_packages < <(
   {
@@ -328,7 +331,7 @@ image_pacman_conf="$build_cache_dir/pacman-root-image.conf"
 sed "/^\[options\]/a CacheDir = /var/cache/omarchy/mirror/offline/" \
   "$build_cache_dir/pacman-offline.conf" >"$image_pacman_conf"
 
-# The stream ships as a plain file in the ISO9660 tree next to airootfs.sfs,
+# The filesystem image ships as a plain file in the ISO9660 tree next to airootfs.sfs,
 # not inside the squashfs: mkarchiso packs its work/iso directory as is, so a
 # file seeded there ends up on the ISO with the boot records intact. Read
 # straight off the boot medium it skips squashfs's per-block copy (~10% off
@@ -341,12 +344,16 @@ sed "/^\[options\]/a CacheDir = /var/cache/omarchy/mirror/offline/" \
 iso_subdir="$(sed -n 's/^install_dir="\(.*\)"$/\1/p' "$build_cache_dir/profiledef.sh")/$(sed -n 's/^arch="\(.*\)"$/\1/p' "$build_cache_dir/profiledef.sh")"
 [[ $iso_subdir == */x86_64 ]] || { echo "ERROR: could not read install_dir/arch from profiledef.sh: '$iso_subdir'" >&2; exit 1; }
 root_image_dir="$build_cache_dir/work/iso/$iso_subdir"
-root_image_stream="$root_image_dir/omarchy-root.btrfs.zst"
+root_image_stream="$root_image_dir/omarchy-root.btrfs.qcow2"
 mkdir -p "$root_image_dir"
+# mkarchiso ships everything in this persistent directory, so remove every
+# previous send-stream/qcow2 representation before creating the authoritative
+# filesystem image.
+rm -f "$root_image_dir"/omarchy-root.*
 # Builds before the move left the stream (and, briefly, its checksum) in the
 # persistent build cache, where they would ship inside the squashfs alongside
 # the new one.
-rm -f "$build_cache_dir/airootfs/var/cache/omarchy/rootfs/omarchy-root.btrfs"*
+rm -f "$build_cache_dir/airootfs/var/cache/omarchy/rootfs"/omarchy-root.*
 
 image_localdb=/tmp/omarchy-root-image-localdb
 echo "[timing] root image start $(date +%s)"
@@ -354,7 +361,7 @@ OMARCHY_IMAGE_LOCALDB_COPY="$image_localdb" \
   bash /builder/build-root-image.sh "$image_pacman_conf" "$root_image_stream" "${image_packages[@]}"
 echo "[timing] root image end $(date +%s)"
 
-# The installer verifies the stream against this before it touches the disk
+# The installer verifies the image against this before it touches the disk
 # (orchestrator prepare_install_target), so a truncated copy on a badly
 # flashed USB fails the install while it is still free to fail. Next to the
 # stream, so it ships on the ISO beside it.
@@ -412,11 +419,14 @@ fi
 echo "Shipping $shipped_count of $mirror_count mirror packages; the root image provides the rest."
 
 # Denominator for the install dashboard's progress bar: what the image holds
-# plus the kernel's closure on top of it, resolved against the image's own
-# local db with the pruned mirror, which is the question the installer's delta
-# pacstrap asks. Plus one for the microcode package every real machine gets.
-# phases.py records expected and actual in the timing JSON, so drift shows up
-# in acceptance runs.
+# plus any missing stock-kernel closure on top of it, resolved against the
+# image's own local db with the pruned mirror, which is the question the
+# installer's delta pacstrap asks. (It is normally empty now that linux is in
+# the image.) Hardware-specific packages cannot be predicted by the builder:
+# in particular, VMs correctly have no CPU microcode delta while physical AMD
+# and Intel machines do. Do not fabricate a fixed +1 that makes every VM look
+# incomplete. phases.py records this deterministic minimum and the actual
+# count in the timing JSON, so real hardware additions remain visible.
 resolve_expected_packages() {
   local resolve_root=/tmp/omarchy-expected-packages
   local image_count resolved
@@ -437,12 +447,12 @@ resolve_expected_packages() {
     --root "$resolve_root" --dbpath "$resolve_root/var/lib/pacman" \
     --noconfirm -S --print --print-format '%n' --needed linux)" || return 1
 
-  echo $(( image_count + $(printf '%s\n' "$resolved" | sort -u | grep -c .) + 1 ))
+  echo $(( image_count + $(printf '%s\n' "$resolved" | sort -u | grep -c .) ))
 }
 
 # Both failures are worth the build: -S --print only aborts when a target is
 # missing from the offline repo, which would fail the delta pacstrap the same
-# way, and the count is image packages plus the kernel closure, so one outside
+# way, and the count is image packages plus any kernel closure, so one outside
 # the plausible range means the root image itself is short of packages. (The
 # dashboard falls back to a time-based curve without the file, but nothing
 # else would catch a short image before an install.)
@@ -456,7 +466,7 @@ fi
 if (( expected_packages < 600 || expected_packages > 2000 )); then
   echo "ERROR: resolved target package count $expected_packages is outside the" >&2
   echo "       expected 600-2000 range. The count is the image's package count" >&2
-  echo "       plus the kernel closure, so this means the root image is short." >&2
+  echo "       plus any kernel closure, so this means the root image is short." >&2
   exit 1
 fi
 printf '%s\n' "$expected_packages" \

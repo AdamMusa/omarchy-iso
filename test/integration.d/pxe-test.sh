@@ -58,7 +58,8 @@ netboot_into_installer() {
   log "Netbooting with no attached install medium (headless)"
   NETDEV_EXTRA=",tftp=$TFTP_ROOT,bootfile=/boot/syslinux/lpxelinux.0"
   NIC_EXTRA=",bootindex=2"
-  start_vm "$RUN_DIR/disk.qcow2" "$RUN_DIR/serial.log" \
+  OMARCHY_ACTIVE_DISK_FORMAT=qcow2 \
+    start_vm "$RUN_DIR/disk.qcow2" "$RUN_DIR/serial.log" \
     -drive "file=$CIDATA_IMG,format=raw,if=none,id=cidata" \
     -device usb-storage,drive=cidata
 
@@ -102,7 +103,7 @@ assert_nbd_medium() {
   check "kernel cmdline pinned copytoram=n" \
     ssh_live_root "grep -q 'copytoram=n' /proc/cmdline"
   check "root image stream is reachable on the netboot medium" \
-    ssh_live_root "test -f /run/archiso/bootmnt/arch/x86_64/omarchy-root.btrfs.zst"
+    ssh_live_root "test -f /run/archiso/bootmnt/arch/x86_64/omarchy-root.btrfs.qcow2"
 }
 
 assert_installed_system() {

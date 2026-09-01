@@ -135,6 +135,13 @@ check_has "the helper's holder diagnosis is forwarded to the log" "holders: init
 # ── What the finish screen promises ──────────────────────────────────────────
 scenario render_finish 0
 check_has "a released target invites the medium out" "You can now remove the install medium" "$TTY_OUT"
+logo_frames=$(grep -o 'OMARCHY' <<<"$TTY_OUT" | wc -l)
+if (( logo_frames < 2 )); then
+  echo "FAIL: finish screen did not repaint a complete static logo after its effect"
+  fails=1
+else
+  echo "ok: finish screen repaints a complete static logo after its effect"
+fi
 
 scenario render_finish 1
 check_has "a held target asks for the medium to stay" \

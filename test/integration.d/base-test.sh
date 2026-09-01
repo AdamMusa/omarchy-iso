@@ -13,6 +13,7 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 ISO="$OMARCHY_INTEGRATION_ISO"
 SSH_PORT="${OMARCHY_INTEGRATION_SSH_PORT:-2322}"
 MEMORY="${OMARCHY_INTEGRATION_MEMORY:-8192}"
+DISK_FORMAT="${OMARCHY_INTEGRATION_DISK_FORMAT:-qcow2}"
 INSTALL_TIMEOUT="${OMARCHY_INTEGRATION_INSTALL_TIMEOUT:-2400}"
 NO_PREVIEW="${OMARCHY_INTEGRATION_NO_PREVIEW:-false}"
 BOOT_TIMEOUT=600
@@ -36,7 +37,7 @@ if [[ $FIRMWARE == bios ]]; then
   BASE_DIR+="-bios"
 fi
 RUN_DIR="$BASE_DIR/runs/$(date +%Y%m%d-%H%M%S)-$SCENARIO"
-BASE_DISK="$BASE_DIR/base.qcow2"
+BASE_DISK="$BASE_DIR/base.$DISK_FORMAT"
 BASE_OVMF="$BASE_DIR/OVMF_VARS.4m.fd"
 ACTIVE_OVMF="$BASE_OVMF"
 SSH_KEY="$BASE_DIR/id_ed25519"
@@ -174,6 +175,7 @@ trap cleanup EXIT
 
 start_vm() {
   local disk="$1" serial="$2"
+  local disk_format="${OMARCHY_ACTIVE_DISK_FORMAT:-$DISK_FORMAT}"
   shift 2
 
   # UEFI needs the OVMF firmware pair; BIOS boots QEMU's built-in SeaBIOS with
@@ -191,7 +193,7 @@ start_vm() {
     -smp "$(nproc)" \
     -m "$MEMORY" \
     "${firmware_args[@]}" \
-    -drive file="$disk",format=qcow2,if=none,id=drive0 \
+    -drive file="$disk",format="$disk_format",cache=none,if=none,id=drive0 \
     -device virtio-blk-pci,drive=drive0,bootindex=1 \
     -device virtio-vga \
     -display none \
@@ -205,16 +207,31 @@ start_vm() {
     "$@"
 }
 
+# Model a physical target on Btrfs hosts. A sparse raw file with normal COW
+# can stall on host block-group allocation after several rapid full-disk test
+# rewrites, even though the guest I/O is identical. NOCOW removes that
+# host-only variance without adding a cache or changing the disk contents.
+set_raw_disk_physical_semantics() {
+  local disk="$1"
+  [[ $(stat -f -c %T -- "$disk") == btrfs ]] || return 0
+  chattr +C -- "$disk"
+  lsattr -d -- "$disk" | awk '{print $1}' | grep -q C || {
+    echo "Could not give raw Btrfs fixture NOCOW semantics: $disk" >&2
+    return 1
+  }
+}
+
 # Boot a throwaway overlay of the installed base. The disk gets a per-run
 # overlay; the firmware vars need the same isolation or NVRAM state would
 # leak between runs.
 start_vm_from_base() {
-  qemu-img create -f qcow2 -b "$BASE_DISK" -F qcow2 "$RUN_DIR/run.qcow2" >/dev/null
+  qemu-img create -f qcow2 -b "$BASE_DISK" -F "$DISK_FORMAT" "$RUN_DIR/run.qcow2" >/dev/null
   if [[ $FIRMWARE == uefi ]]; then
     cp "$BASE_OVMF" "$RUN_DIR/OVMF_VARS.4m.fd"
     ACTIVE_OVMF="$RUN_DIR/OVMF_VARS.4m.fd"
   fi
-  start_vm "$RUN_DIR/run.qcow2" "$RUN_DIR/serial.log"
+  OMARCHY_ACTIVE_DISK_FORMAT=qcow2 \
+    start_vm "$RUN_DIR/run.qcow2" "$RUN_DIR/serial.log"
 }
 
 # ------------------------------------------------------------ console driver
@@ -295,7 +312,7 @@ type_text() {
 # --------------------------------------------------------------------- guest
 
 ssh_guest() {
-  ssh -i "$SSH_KEY" -p "$SSH_PORT" \
+  ssh -n -i "$SSH_KEY" -p "$SSH_PORT" \
     -o BatchMode=yes \
     -o IdentitiesOnly=yes \
     -o StrictHostKeyChecking=no \
@@ -667,6 +684,26 @@ wait_for_unattended_install() {
   done
 }
 
+collect_install_artifacts() {
+  local artifact remote
+
+  while read -r artifact remote; do
+    if ! ssh_sudo "cat $remote" >"$RUN_DIR/$artifact"; then
+      echo "Installed system is missing required artifact: $remote" >&2
+      return 1
+    fi
+  done <<'EOF'
+omarchy-install-timing.json /var/log/omarchy-install-timing.json
+omarchy-install.log /var/log/omarchy-install.log
+pacman.log /var/log/pacman.log
+EOF
+
+  if ! ssh_guest "pacman -Q" >"$RUN_DIR/installed-packages.txt"; then
+    echo "Could not capture the installed package manifest" >&2
+    return 1
+  fi
+}
+
 install_phase() {
   log "Installing $(basename "$ISO") unattended via cidata (headless)"
 
@@ -677,7 +714,13 @@ install_phase() {
   # Build under a staging name: the finished base is promoted only after a
   # clean shutdown, so a failed install can never pass for a reusable base.
   rm -f "$BASE_DISK" "$BASE_DISK.building"
-  qemu-img create -f qcow2 "$BASE_DISK.building" 40G >/dev/null
+  if [[ $DISK_FORMAT == raw ]]; then
+    truncate -s 0 "$BASE_DISK.building"
+    set_raw_disk_physical_semantics "$BASE_DISK.building"
+    truncate -s 40G "$BASE_DISK.building"
+  else
+    qemu-img create -f "$DISK_FORMAT" "$BASE_DISK.building" 40G >/dev/null
+  fi
   if [[ $FIRMWARE == uefi ]]; then
     cp "$OVMF_VARS_TEMPLATE" "$BASE_OVMF"
     ACTIVE_OVMF="$BASE_OVMF"
@@ -689,12 +732,13 @@ install_phase() {
   # not boot the isohybrid image off a fallback USB device here, so USB is not
   # worth the flakiness. The copytoram-off / USB path is covered by unit tests.
   start_vm "$BASE_DISK.building" "$RUN_DIR/install-serial.log" \
-    -drive "file=$ISO,media=cdrom,if=none,format=raw,id=cdrom0" \
+    -drive "file=$ISO,media=cdrom,cache=none,if=none,format=raw,id=cdrom0" \
     -device ide-cd,drive=cdrom0,bootindex=2 \
     -drive "file=$CIDATA_IMG,format=raw,if=none,id=cidata" \
     -device usb-storage,drive=cidata
 
   wait_for_unattended_install install || return 1
+  collect_install_artifacts || return 1
 
   log "Installed system is up. Saving base image."
   stop_vm

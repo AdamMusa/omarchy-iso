@@ -21,7 +21,7 @@
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/base-test.sh"
 
 CORRUPT_ISO="$BASE_DIR/corrupt.iso"
-STREAM=arch/x86_64/omarchy-root.btrfs.zst
+STREAM=arch/x86_64/omarchy-root.btrfs.qcow2
 VERIFY_UNIT=omarchy-root-image-verify.service
 STATE=/run/omarchy-install/state.json
 
@@ -96,8 +96,9 @@ install_from_corrupt_medium() {
   fi
 
   log "Autoinstalling from the corrupt medium (headless)"
-  start_vm "$RUN_DIR/disk.qcow2" "$RUN_DIR/serial.log" \
-    -drive "file=$CORRUPT_ISO,media=cdrom,if=none,format=raw,id=cdrom0" \
+  OMARCHY_ACTIVE_DISK_FORMAT=qcow2 \
+    start_vm "$RUN_DIR/disk.qcow2" "$RUN_DIR/serial.log" \
+    -drive "file=$CORRUPT_ISO,media=cdrom,cache=none,if=none,format=raw,id=cdrom0" \
     -device ide-cd,drive=cdrom0,bootindex=2 \
     -drive "file=$CIDATA_IMG,format=raw,if=none,id=cidata" \
     -device usb-storage,drive=cidata

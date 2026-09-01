@@ -3,30 +3,23 @@
 # Build the root filesystem image the installer unpacks instead of pacstrapping
 # every package on the target machine.
 #
-# The target install is the same ~940 packages for everyone; only the kernel,
-# CPU microcode, audio firmware and Tailscale vary per machine. So pacstrap the
-# invariant set once here, at build time, into a btrfs subvolume compressed at
-# a high zstd level (see IMAGE_COMPRESS below — higher than the installer's own
-# compress=zstd, since the level only costs build time), and ship it as a
-# `btrfs send --compressed-data` stream. At install time `btrfs receive` writes
-# the compressed extents straight to disk (no decompress/recompress), which
-# measured at roughly half the time of extracting the same packages with pacman,
-# independent of CPU count; the per-machine delta is a small pacstrap after.
-#
-# The stream itself then gets an outer zstd layer (STREAM_COMPRESS below). The
-# per-extent compression above cannot see past a 128 KiB extent, so the send
-# stream still carries its protocol framing uncompressed plus redundancy that
-# only exists across extents; one whole-stream pass reclaims ~11% (measured on
-# a 3.75 GB stream — and the level barely matters, the long-range window does).
-# The installer decompresses it in the receive pipe, where zstd -d is orders of
-# magnitude faster than any install medium; the extents inside still land on
-# disk as they are.
+# The target install is the same ~940 packages for everyone; only alternate
+# kernels, CPU microcode, audio firmware and Tailscale vary per machine. The
+# normal linux kernel is part of this default image. Pacstrap that common set
+# once here, at build time, into a Btrfs subvolume compressed at a high zstd
+# level (see IMAGE_COMPRESS below — higher than the installed system's normal
+# level, since the level only costs build time). The compact filesystem is
+# shipped as qcow2 so the installer can restore allocated clusters in parallel
+# instead of replaying roughly 100,000 individual Btrfs send commands. It is
+# still a normal independent filesystem after restore: the installer rewrites
+# its UUID, grows it to the partition, and creates the machine-specific writable
+# subvolumes before continuing with the small per-machine package delta.
 #
 # Usage: build-root-image.sh <pacman.conf> <output-stream> <package>...
 #
 #   pacman.conf     Config whose repositories resolve every package; its
 #                   CacheDir must hold the package files so nothing is copied.
-#   output-stream   Where to write the send stream.
+#   output-stream   Where to write the qcow2 filesystem image.
 #   package...      Packages to pacstrap into the image.
 #
 # Environment:
@@ -56,22 +49,15 @@ fi
 
 # Forced zstd at a higher level than the installer's own compress=zstd (level
 # 3): btrfs's incompressibility heuristic declines a lot of data in this tree
-# that zstd handles fine, and the level only costs build time. btrfs receive
-# stores the extents as they arrive, so neither choice affects install speed;
-# the installed system writes new data at its own mount option either way.
+# that zstd handles fine, and the level only costs build time. The installed
+# system writes new data at its own mount option after the image is restored.
 IMAGE_COMPRESS="compress-force=zstd:15"
-# Outer layer over the whole send stream. Level 15 and the 128 MiB long-range
-# window are each worth a few hundred MB/-tens of MB respectively over the
-# defaults; beyond either lies ~0.3% for minutes of build time (level 19+) or
-# a stream a stock `zstd -d` refuses (--long>27 exceeds the decoder's default
-# window limit). -T0 is a pure win: ~25 s on a many-core builder, same bytes.
-STREAM_COMPRESS=(zstd -q -15 --long=27 -T0)
-# Name of the subvolume inside the stream. The orchestrator looks for this name
-# after `btrfs receive` (phases_impl.ROOT_IMAGE_SUBVOLUME).
+# Name of the subvolume inside the filesystem image. The orchestrator looks for
+# it after the qcow2 restore (phases_impl.ROOT_IMAGE_SUBVOLUME).
 IMAGE_SUBVOLUME="omarchy-root"
 
 # Boot-image pacman hooks that must not run while the image is built: there is
-# no kernel in the image and no ESP to deploy to. pacstrap reads hooks from the
+# no ESP in the image to deploy the included kernel to. pacstrap reads hooks from the
 # building system's /etc/pacman.d/hooks (pacman.conf(5): HookDir is absolute,
 # the target root is not prepended), so mask them here, the same way the
 # orchestrator masks the live ISO's around its pacstrap. Keep in step with
@@ -203,7 +189,35 @@ echo "Root image holds $installed packages"
 
 sync
 btrfs property set -ts "$root" ro true
+
+# A small virtual size lets the same image restore onto every supported target
+# partition. Keep deterministic headroom over Btrfs's calculated minimum, align
+# it to 256 MiB, then trim free ranges so qemu-img need not allocate them.
+read -r minimum_size _ < <(btrfs inspect-internal min-dev-size "$mnt")
+alignment=$((256 * 1024 * 1024))
+headroom=$((512 * 1024 * 1024))
+image_size=$((
+  (minimum_size + headroom + alignment - 1) / alignment * alignment
+))
+btrfs filesystem resize "$image_size" "$mnt"
+fstrim "$mnt" >/dev/null 2>&1 || true
+sync
+
+# qemu-img must see an unmounted, size-matched raw filesystem. Detach it here
+# and clear the trap variables so cleanup cannot unmount/detach them twice.
+stop_image_gpg_agents
+umount -R "$mnt"
+losetup -d "$loop"
+loop=""
+truncate -s "$image_size" "$backing"
+
 rm -f "$output"
 mkdir -p "$(dirname "$output")"
-btrfs send -q --compressed-data "$root" | "${STREAM_COMPRESS[@]}" -o "$output"
-echo "Root image stream: $(du -h "$output" | cut -f1) at $output"
+workers=$(nproc)
+# qemu-img rejects more than 16 conversion coroutines, even on larger hosts.
+((workers > 16)) && workers=16
+qemu-img convert -q -f raw -O qcow2 \
+  -o cluster_size=65536,lazy_refcounts=on -m "$workers" \
+  "$backing" "$output"
+qemu-img check -q -f qcow2 "$output"
+echo "Root filesystem image: $(du -h "$output" | cut -f1) at $output ($(numfmt --to=iec "$image_size") virtual)"

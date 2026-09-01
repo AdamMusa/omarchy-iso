@@ -494,13 +494,16 @@ install_duration() {
 
   if [[ -f $STATE_FILE ]]; then
     duration="$(jq -r '
-      ((.started_at // 0) | tonumber? // 0) as $started
+      ((.duration_seconds // -1) | tonumber? // -1) as $duration
+      | ((.started_at // 0) | tonumber? // 0) as $started
       | ((.finished_at // 0) | tonumber? // 0) as $finished
-      | if $started <= 0 or $finished <= 0 or $finished < $started then empty
-        else (($finished - $started) | round) as $secs
-          | if $secs >= 3600 then "\($secs / 3600 | floor)h \($secs % 3600 / 60 | floor)m \($secs % 60)s"
-            else "\($secs / 60 | floor)m \($secs % 60)s"
-            end
+      | if $duration != null and $duration >= 0 then ($duration | round)
+        elif $started > 0 and $finished > 0 and $finished >= $started then (($finished - $started) | round)
+        else null
+        end as $secs
+      | if $secs == null then empty
+        elif $secs >= 3600 then "\($secs / 3600 | floor)h \($secs % 3600 / 60 | floor)m \($secs % 60)s"
+        else "\($secs / 60 | floor)m \($secs % 60)s"
         end
     ' "$STATE_FILE" 2>/dev/null || true)"
     [[ -n $duration ]] && { printf '%s' "$duration"; return 0; }
@@ -572,7 +575,15 @@ render_finish() {
       laseretch \
       --final-gradient-stops 2 \
       >"$TTY_PATH" 2>/dev/null || dashboard_log "logo effect skipped (ttfx exited $?)"
-    printf '%s%d;1H' "$CSI" "$((FINISH_TOP_ROW + LOGO_HEIGHT + 5))" >"$TTY_PATH"
+    # The effect deliberately breaks the logo into sparks before rebuilding
+    # it. Repaint the canonical static logo after the child exits so an
+    # unattended reboot cannot leave the last visible/captured frame halfway
+    # through that transition.
+    {
+      printf '%s%d;1H' "$CSI" "$FINISH_TOP_ROW"
+      render_logo
+      printf '%s%d;1H' "$CSI" "$((FINISH_TOP_ROW + LOGO_HEIGHT + 5))"
+    } >"$TTY_PATH"
   fi
 }
 
@@ -1010,6 +1021,9 @@ if reboot_prompt; then
   if [[ ${OMARCHY_UI_AUTO_REBOOT:-} == "no" ]]; then
     exit 0
   fi
+  # Give headless framebuffer recorders (and slow physical displays) one
+  # complete static finish frame after the animated logo has settled.
+  interactive || sleep 1
   printf '%s' "$CLEAR" >"$TTY_PATH" 2>/dev/null || true
   reboot_now
 fi

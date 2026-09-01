@@ -65,8 +65,9 @@ install_from_slow_medium() {
   fi
 
   log "Autoinstalling from a throttled medium (headless)"
-  start_vm "$RUN_DIR/disk.qcow2" "$RUN_DIR/serial.log" \
-    -drive "file=$ISO,media=cdrom,if=none,format=raw,id=cdrom0,throttling.bps-total=$BOOT_THROTTLE_BPS" \
+  OMARCHY_ACTIVE_DISK_FORMAT=qcow2 \
+    start_vm "$RUN_DIR/disk.qcow2" "$RUN_DIR/serial.log" \
+    -drive "file=$ISO,media=cdrom,cache=none,if=none,format=raw,id=cdrom0,throttling.bps-total=$BOOT_THROTTLE_BPS" \
     -device ide-cd,drive=cdrom0,bootindex=2 \
     -drive "file=$CIDATA_IMG,format=raw,if=none,id=cidata" \
     -device usb-storage,drive=cidata \

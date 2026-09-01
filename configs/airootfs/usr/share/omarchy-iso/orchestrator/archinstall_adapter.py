@@ -171,8 +171,8 @@ def install_base_delta(
 ) -> None:
     """Installer.minimal_installation for a target that already holds the root
     image: everything it does around its base pacstrap, with the pacstrap
-    reduced to the base packages the image does not carry (the kernel and the
-    CPU microcode).
+    reduced to the base packages the image does not carry (normally just CPU
+    microcode; alternate machines also add their selected kernel).
 
     Mirrors archinstall 4.4's minimal_installation step for step so the target
     ends up as that call would leave it: filesystem/encryption preparation
