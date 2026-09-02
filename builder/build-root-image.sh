@@ -216,8 +216,11 @@ mkdir -p "$(dirname "$output")"
 workers=$(nproc)
 # qemu-img rejects more than 16 conversion coroutines, even on larger hosts.
 ((workers > 16)) && workers=16
-qemu-img convert -q -f raw -O qcow2 \
-  -o cluster_size=65536,lazy_refcounts=on -m "$workers" \
+# Compress qcow2 clusters as well as the filesystem inside them. This covers
+# filesystem metadata and cluster slack that Btrfs compression cannot reach,
+# while qemu-img restores the clusters transparently across its coroutines.
+qemu-img convert -c -q -f raw -O qcow2 \
+  -o cluster_size=65536,lazy_refcounts=on,compression_type=zstd -m "$workers" \
   "$backing" "$output"
 qemu-img check -q -f qcow2 "$output"
 echo "Root filesystem image: $(du -h "$output" | cut -f1) at $output ($(numfmt --to=iec "$image_size") virtual)"
