@@ -24,7 +24,7 @@ done
 echo "ok: alternate and hardware-specific packages remain per-machine"
 
 grep -Fq 'qemu-img convert -c -q -f raw -O qcow2' "$ROOT/builder/build-root-image.sh"
-grep -Fq 'cluster_size=65536,lazy_refcounts=on,compression_type=zstd' \
+grep -Fq 'cluster_size=1048576,lazy_refcounts=on,compression_type=zstd' \
   "$ROOT/builder/build-root-image.sh"
 grep -Fq '((workers > 16)) && workers=16' "$ROOT/builder/build-root-image.sh"
 if grep -F 'echo $(( image_count +' "$BUILDER" | grep -Fq '+ 1'; then
