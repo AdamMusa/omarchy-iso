@@ -372,6 +372,29 @@ def _hasher_read_pos() -> int | None:
     return None
 
 
+def _remove_baked_stock_kernel_for_t2(ctx: InstallContext, config) -> None:
+    """Remove the image's stock kernel when the target selected linux-t2."""
+    selected = list(config.kernels or [])
+    if "linux-t2" not in selected or "linux" in selected:
+        return
+
+    if not arch.target_has_package(ctx.target, "linux-t2"):
+        raise RuntimeError("selected T2 kernel linux-t2 is not installed")
+    if not arch.target_has_package(ctx.target, "linux"):
+        return
+
+    info("› removing baked stock kernel from T2 target")
+    result = subprocess.run(
+        ["arch-chroot", str(ctx.target), "pacman", "-Rdd", "--noconfirm", "linux"],
+        check=False, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown pacman error").strip()
+        raise RuntimeError(f"could not remove stock linux kernel from T2 target: {detail}")
+    if arch.target_has_package(ctx.target, "linux"):
+        raise RuntimeError("stock linux kernel remains installed on T2 target")
+
+
 def arch_install_system(ctx: InstallContext) -> None:
     """Install the target system: archinstall partitions and mounts per the
     configurator JSON, the root image is unpacked onto the mounted layout, and
@@ -434,6 +457,7 @@ def arch_install_system(ctx: InstallContext) -> None:
                         if config.locale_config else None
                     ),
                 )
+                _remove_baked_stock_kernel_for_t2(ctx, config)
 
             if not configure_keyboard(installer.target, kb_layout):
                 error(f"Invalid keyboard language specified: {kb_layout}")
@@ -2247,11 +2271,16 @@ def validate_boot(ctx: InstallContext) -> None:
         if not limine_binary.exists() or limine_binary.stat().st_size == 0:
             raise RuntimeError(f"{limine_binary} missing or empty")
 
-        # Hardware packages (omarchy-hw-intel-ptl, …) can swap the kernel out
-        # from under us mid-install, so trust what's on disk over what we asked
-        # for and only fall back to the configured name when nothing's there.
+        # Hardware packages (omarchy-hw-intel-ptl, …) can swap the configured
+        # kernel out mid-install. When it remains installed, require its own
+        # UKI: an unusable stock UKI must not hide a failed linux-t2 build.
         uki_dir = esp_mount / "EFI" / "Linux"
-        candidates = _installed_kernels(ctx) or [kernel]
+        installed_kernels = _installed_kernels(ctx)
+        candidates = (
+            [kernel]
+            if kernel in installed_kernels
+            else installed_kernels or [kernel]
+        )
         ukis = [uki_dir / f"{uki_prefix}_{name}.efi" for name in candidates]
         if not any(uki.exists() and uki.stat().st_size for uki in ukis):
             raise RuntimeError(f"{' / '.join(str(uki) for uki in ukis)} missing or empty")
