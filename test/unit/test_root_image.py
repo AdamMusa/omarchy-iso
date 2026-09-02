@@ -523,7 +523,7 @@ class RestoreRootImageTest(unittest.TestCase):
         cmd = run.call_args.args[0]
         self.assertEqual(
             cmd,
-            ["qemu-img", "convert", "-q", "-f", "qcow2", "-O", "raw", "-n",
+            ["qemu-img", "convert", "-q", "-f", "qcow2", "-O", "raw", "-W", "-n",
              "-m", "16", "/image.qcow2", "/dev/mapper/root"],
         )
 

@@ -784,15 +784,16 @@ def _restore_root_image(image: Path, device: str) -> None:
     """Restore allocated qcow2 clusters to an existing target block device.
 
     -n is essential: qemu-img must write the device, never try to create or
-    truncate it. Coroutines make the block copy parallel while leaving the
-    resulting filesystem bytes independent of scheduling order.
+    truncate it. -W lets those coroutines issue independent output writes out
+    of order; the filesystem is not used until the completed image is checked,
+    resized, and mounted.
     """
     # qemu-img rejects values above 16 even when the machine exposes more
     # CPUs. Keep this host-independent: a 24+ thread live system must restore
     # the same image successfully instead of failing before the first write.
     workers = max(1, min(os.cpu_count() or 1, 16))
     result = subprocess.run(
-        ["qemu-img", "convert", "-q", "-f", "qcow2", "-O", "raw", "-n",
+        ["qemu-img", "convert", "-q", "-f", "qcow2", "-O", "raw", "-W", "-n",
          "-m", str(workers), str(image), device],
         check=False, capture_output=True, text=True,
     )
