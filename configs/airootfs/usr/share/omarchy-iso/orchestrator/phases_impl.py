@@ -17,6 +17,9 @@ Phase ordering (full-disk and protected/pre-mounted):
                              systemd unit after the last pacstrap
     configure_hibernation  → root-owned swap/resume drop-ins
     run_system_finalizer   → arch-chroot root omarchy-apply-system, including Snapper
+    stage_provisioning_state
+                           → stage deferred-provisioning state and any cryptkey
+                             material needed by the final UKI build
     finalize_boot_and_user_setup
                            → final Limine/UKI build in parallel with the
                              ordered user → login → SSH → Tailscale → DNS branch
@@ -2292,6 +2295,11 @@ def finalize_boot_and_user_setup(ctx: InstallContext) -> None:
     before this phase. User provisioning and its login/network tail are ordered
     with respect to each other, but do not feed that UKI. Both branches join
     before validate_boot and the factory snapshot.
+
+    Invariant: the user branch must not install, remove, or upgrade packages,
+    call a package-manager helper, or otherwise trigger mkinitcpio. Doing so
+    could start a second UKI build against the files Limine is writing in the
+    boot branch. Keep any such work in a serial phase before this fan-out.
     """
     branches: tuple[tuple[str, tuple[FinalizationStep, ...]], ...] = (
         ("boot", (("Finalizing Limine boot", finalize_limine_boot),)),
