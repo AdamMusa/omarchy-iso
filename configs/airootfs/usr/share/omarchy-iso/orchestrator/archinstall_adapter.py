@@ -47,6 +47,7 @@ from typing import Iterator
 from archinstall.lib.args import ArchConfig, ArchConfigHandler
 from archinstall.lib.authentication.authentication_handler import AuthenticationHandler
 from archinstall.lib.disk.filesystem import FilesystemHandler
+from archinstall.lib.disk.luks import Luks2
 from archinstall.lib.disk.utils import get_parent_device_path, get_unique_path_for_device, udev_sync
 from archinstall.lib.hardware import SysInfo
 from archinstall.lib.installer import Installer
@@ -56,6 +57,7 @@ from archinstall.lib.models.device import DiskLayoutType, EncryptionType
 from archinstall.lib.pacman.config import PacmanConfig
 from archinstall.lib.models.users import User
 
+from .luks_lifecycle import defer_mapper_locks
 from .ui import info
 
 
@@ -115,11 +117,23 @@ def perform_filesystem_operations(arch_config: ArchConfig) -> None:
         else {}
     )
 
+    # Direct LUKS layouts are already open after format_encrypted. Keep only
+    # those freshly configured mappers open so Btrfs setup and Installer can
+    # reuse them instead of paying the password KDF two more times. LVM
+    # layouts have a different lifecycle and the root-image path rejects them.
+    encryption = arch_config.disk_config.disk_encryption
+    mapper_names = {
+        part.mapper_name
+        for part in (encryption.partitions if encryption else [])
+        if part.mapper_name
+    } if encryption and encryption.encryption_type == EncryptionType.LUKS else set()
+
     attempts = 3
     for attempt in range(1, attempts + 1):
         udev_sync()
         try:
-            handler.perform_filesystem_operations(**fs_kwargs)
+            with defer_mapper_locks(Luks2, mapper_names):
+                handler.perform_filesystem_operations(**fs_kwargs)
             return
         except Exception as exc:
             if attempt == attempts or "unable to inform the kernel" not in str(exc):
