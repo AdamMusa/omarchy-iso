@@ -36,12 +36,7 @@ def build_phases(ctx: InstallContext):
         configure_hibernation,
         run_system_finalizer,
         stage_provisioning_state,
-        finalize_limine_boot,
-        run_chroot_finalizer,
-        configure_dns_resolver,
-        configure_login,
-        configure_ssh_access,
-        configure_tailscale,
+        finalize_boot_and_user_setup,
         validate_boot,
         create_factory_snapshot,
     )
@@ -52,15 +47,10 @@ def build_phases(ctx: InstallContext):
         ("Installing Arch + Omarchy",  arch_install_system),
         ("Configuring hibernation",    configure_hibernation),
         ("Configuring system",         run_system_finalizer),
-        # Before finalize_limine_boot: the deferred-provisioning cryptkey drop-in and keyfile
-        # must be in place for the final UKI build.
-        ("Staging provisioning",          stage_provisioning_state),
-        ("Finalizing Limine boot",     finalize_limine_boot),
-        ("Finalizing user",            run_chroot_finalizer),
-        ("Configuring login",          configure_login),
-        ("Configuring SSH access",     configure_ssh_access),
-        ("Configuring Tailscale",      configure_tailscale),
-        ("Configuring DNS resolver",   configure_dns_resolver),
+        # Before the parallel fan: the deferred-provisioning cryptkey drop-in
+        # and keyfile must be in place for the final UKI build.
+        ("Staging provisioning",       stage_provisioning_state),
+        ("Finalizing boot and user setup", finalize_boot_and_user_setup),
         ("Validating boot setup",      validate_boot),
         ("Creating factory snapshot",  create_factory_snapshot),
     ]

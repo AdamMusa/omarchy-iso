@@ -17,11 +17,9 @@ Phase ordering (full-disk and protected/pre-mounted):
                              systemd unit after the last pacstrap
     configure_hibernation  → root-owned swap/resume drop-ins
     run_system_finalizer   → arch-chroot root omarchy-apply-system, including Snapper
-    finalize_limine_boot   → final Limine config/UKI build after hardware drop-ins
-    run_chroot_finalizer   → arch-chroot -u user omarchy-provision-user
-    configure_login        → sddm state + encrypted-install autologin
-    configure_ssh_access   → authorized_keys for autoinstall; no-op otherwise
-    configure_tailscale    → tailnet join staged for first boot; no-op otherwise
+    finalize_boot_and_user_setup
+                           → final Limine/UKI build in parallel with the
+                             ordered user → login → SSH → Tailscale → DNS branch
     validate_boot          → assert UKI / limine.conf / kernel cmdline are sane
     create_factory_snapshot→ joins the keyring unit, then snapshots @ as @factory
 """
@@ -37,6 +35,8 @@ import shutil
 import subprocess
 import textwrap
 import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -47,6 +47,26 @@ from .context import InstallContext
 from .keyboard import configure_keyboard
 from .phases import write_state
 from .ui import error, info
+
+
+def _private_arch_chroot_command(
+    ctx: InstallContext, *args: str, user: str | None = None,
+) -> list[str]:
+    """Build an arch-chroot command isolated from sibling chroot mounts.
+
+    arch-chroot mounts /proc, /dev and /sys below the target and tears them
+    down on exit. Concurrent invocations therefore need private mount
+    namespaces or one can unmount the other branch's API filesystems.
+    """
+    command = (
+        ["unshare", "--mount", "--propagation", "private", "--", "arch-chroot"]
+        if shutil.which("unshare") is not None
+        else ["arch-chroot"]
+    )
+    if user:
+        command += ["-u", user]
+    command += [str(ctx.target), *args]
+    return command
 
 
 @contextmanager
@@ -1689,11 +1709,10 @@ def _run_target_setup_command(ctx: InstallContext, cmd: list[str], *, user: str 
         env_extras.append("OMARCHY_INSTALL_DEBUG=1")
         _debug_log(ctx, "running target setup command: " + " ".join(cmd))
 
-    chroot_cmd = ["arch-chroot"]
+    chroot_cmd = _private_arch_chroot_command(ctx, user=user)
     if user:
-        chroot_cmd += ["-u", user]
         env_extras.extend(_target_user_env(ctx, user))
-    chroot_cmd += [str(ctx.target), "env", "--unset=XDG_RUNTIME_DIR", *env_extras, *cmd]
+    chroot_cmd += ["env", "--unset=XDG_RUNTIME_DIR", *env_extras, *cmd]
 
     try:
         subprocess.run(chroot_cmd, check=True)
@@ -1886,10 +1905,10 @@ def finalize_limine_boot(ctx: InstallContext) -> None:
     if not limine_conf.exists():
         raise RuntimeError(f"{limine_conf} missing")
 
-    subprocess.run(["arch-chroot", str(ctx.target), "limine-update"], check=True)
+    subprocess.run(_private_arch_chroot_command(ctx, "limine-update"), check=True)
 
     subprocess.run(
-        ["arch-chroot", str(ctx.target), "btrfs", "quota", "disable", "/"],
+        _private_arch_chroot_command(ctx, "btrfs", "quota", "disable", "/"),
         check=False,
         capture_output=True,
     )
@@ -2012,8 +2031,9 @@ def configure_login(ctx: InstallContext) -> None:
             f"[Last]\nSession=omarchy.desktop\nUser={ctx.username}\n"
         )
         subprocess.run(
-            ["arch-chroot", str(ctx.target), "chown", "sddm:sddm",
-             "/var/lib/sddm", "/var/lib/sddm/state.conf"],
+            _private_arch_chroot_command(
+                ctx, "chown", "sddm:sddm", "/var/lib/sddm", "/var/lib/sddm/state.conf",
+            ),
             check=False, capture_output=True,
         )
 
@@ -2021,7 +2041,7 @@ def configure_login(ctx: InstallContext) -> None:
     autologin.unlink(missing_ok=True)
 
     subprocess.run(
-        ["arch-chroot", str(ctx.target), "systemctl", "enable", "sddm.service"],
+        _private_arch_chroot_command(ctx, "systemctl", "enable", "sddm.service"),
         check=False, capture_output=True,
     )
 
@@ -2064,14 +2084,16 @@ def configure_ssh_access(ctx: InstallContext) -> None:
         # Uncaptured so a failure shows up in the install log, and checked because
         # a root-owned authorized_keys is one sshd refuses to read.
         subprocess.run(
-            ["arch-chroot", str(ctx.target), "chown", "-R",
-             f"{ctx.username}:{ctx.username}", f"/home/{ctx.username}/.ssh"],
+            _private_arch_chroot_command(
+                ctx, "chown", "-R", f"{ctx.username}:{ctx.username}",
+                f"/home/{ctx.username}/.ssh",
+            ),
             check=True,
         )
 
     info("› enabling sshd")
     subprocess.run(
-        ["arch-chroot", str(ctx.target), "systemctl", "enable", "sshd.service"],
+        _private_arch_chroot_command(ctx, "systemctl", "enable", "sshd.service"),
         check=True,
     )
 
@@ -2085,7 +2107,9 @@ def configure_ssh_access(ctx: InstallContext) -> None:
     # thing to check here; the rule landing in the file is the thing that
     # matters.
     info("› allowing SSH through ufw")
-    subprocess.run(["arch-chroot", str(ctx.target), "ufw", "allow", "ssh"], check=False)
+    subprocess.run(
+        _private_arch_chroot_command(ctx, "ufw", "allow", "ssh"), check=False,
+    )
 
     rules = ctx.target / "etc" / "ufw" / "user.rules"
     text = rules.read_text() if rules.exists() else ""
@@ -2176,8 +2200,10 @@ def configure_tailscale(ctx: InstallContext) -> None:
     unit.parent.mkdir(parents=True, exist_ok=True)
     unit.write_text(TAILSCALE_JOIN_UNIT)
     subprocess.run(
-        ["arch-chroot", str(ctx.target), "systemctl", "enable",
-         "tailscaled.service", "omarchy-tailscale-join.service"],
+        _private_arch_chroot_command(
+            ctx, "systemctl", "enable", "tailscaled.service",
+            "omarchy-tailscale-join.service",
+        ),
         check=True,
     )
 
@@ -2187,7 +2213,9 @@ def configure_tailscale(ctx: InstallContext) -> None:
     # the node joins the tailnet and is then unreachable over it.
     info("› allowing tailnet traffic through ufw")
     subprocess.run(
-        ["arch-chroot", str(ctx.target), "ufw", "allow", "in", "on", "tailscale0"],
+        _private_arch_chroot_command(
+            ctx, "ufw", "allow", "in", "on", "tailscale0",
+        ),
         check=False,
     )
 
@@ -2219,6 +2247,85 @@ def _tailscale_authkey(path: Path) -> str:
         raise RuntimeError(f"{path} contains {len(keys)} keys; expected exactly one")
 
     return keys[0]
+
+
+FinalizationStep = tuple[str, Callable[[InstallContext], None]]
+
+
+def _run_finalization_branch(
+    ctx: InstallContext, branch: str, steps: tuple[FinalizationStep, ...],
+) -> tuple[list[dict], tuple[str, Exception] | None]:
+    """Run one ordered side of the finalization fan and retain its timings."""
+    records: list[dict] = []
+    for name, fn in steps:
+        info(f"› {name} [{branch} branch]")
+        started = time.monotonic()
+        try:
+            fn(ctx)
+        except Exception as exc:  # noqa: BLE001
+            elapsed = time.monotonic() - started
+            records.append({
+                "name": name,
+                "branch": branch,
+                "status": "failed",
+                "elapsed": elapsed,
+                "error": str(exc),
+            })
+            return records, (name, exc)
+
+        elapsed = time.monotonic() - started
+        records.append({
+            "name": name,
+            "branch": branch,
+            "status": "ok",
+            "elapsed": elapsed,
+        })
+        info(f"› timing: {name} [{branch} branch]: {elapsed:.3f}s")
+
+    return records, None
+
+
+def finalize_boot_and_user_setup(ctx: InstallContext) -> None:
+    """Run the two independent post-provisioning branches concurrently.
+
+    Limine's UKI build only reads system/provisioning state already finalized
+    before this phase. User provisioning and its login/network tail are ordered
+    with respect to each other, but do not feed that UKI. Both branches join
+    before validate_boot and the factory snapshot.
+    """
+    branches: tuple[tuple[str, tuple[FinalizationStep, ...]], ...] = (
+        ("boot", (("Finalizing Limine boot", finalize_limine_boot),)),
+        ("user", (
+            ("Finalizing user", run_chroot_finalizer),
+            ("Configuring login", configure_login),
+            ("Configuring SSH access", configure_ssh_access),
+            ("Configuring Tailscale", configure_tailscale),
+            ("Configuring DNS resolver", configure_dns_resolver),
+        )),
+    )
+
+    if shutil.which("unshare") is None:
+        info("› unshare unavailable; finalizing branches serially")
+        outcomes = [
+            _run_finalization_branch(ctx, branch, steps)
+            for branch, steps in branches
+        ]
+    else:
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="omarchy-finalize") as pool:
+            futures = [
+                pool.submit(_run_finalization_branch, ctx, branch, steps)
+                for branch, steps in branches
+            ]
+            outcomes = [future.result() for future in futures]
+
+    ctx.state["phase_substeps"] = [
+        record for records, _failure in outcomes for record in records
+    ]
+    failures = [failure for _records, failure in outcomes if failure is not None]
+    if failures:
+        _name, exc = failures[0]
+        detail = "; ".join(f"{failed_name}: {error}" for failed_name, error in failures)
+        raise RuntimeError(f"parallel finalization failed ({detail})") from exc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
