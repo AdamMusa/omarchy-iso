@@ -811,10 +811,11 @@ def _restore_root_image(image: Path, device: str) -> None:
     of order; the filesystem is not used until the completed image is checked,
     resized, and mounted.
     """
-    # qemu-img rejects values above 16 even when the machine exposes more
-    # CPUs. Keep this host-independent: a 24+ thread live system must restore
-    # the same image successfully instead of failing before the first write.
-    workers = max(1, min(os.cpu_count() or 1, 16))
+    # These are I/O coroutines rather than dedicated CPU-bound workers. The
+    # compressed-input/encrypted-output path keeps roughly two per visible CPU
+    # busy, while qemu-img rejects values above 16. Never pass zero on odd
+    # container/cgroup setups where cpu_count() cannot determine a value.
+    workers = min(max(1, os.cpu_count() or 1) * 2, 16)
     result = subprocess.run(
         ["qemu-img", "convert", "-q", "-f", "qcow2", "-O", "raw", "-W", "-n",
          "-m", str(workers), str(image), device],

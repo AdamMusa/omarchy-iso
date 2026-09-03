@@ -514,6 +514,14 @@ class TargetKeyringUnitTest(unittest.TestCase):
 
 
 class RestoreRootImageTest(unittest.TestCase):
+    def test_restore_uses_two_coroutines_per_visible_cpu(self):
+        completed = CompletedProcess([], 0, stdout="", stderr="")
+        with mock.patch.object(phases_impl.os, "cpu_count", return_value=8), \
+             mock.patch.object(phases_impl.subprocess, "run", return_value=completed) as run:
+            phases_impl._restore_root_image(Path("/image.qcow2"), "/dev/mapper/root")
+
+        self.assertEqual(run.call_args.args[0][9:11], ["-m", "16"])
+
     def test_parallel_qcow_restore_never_creates_or_truncates_target(self):
         completed = CompletedProcess([], 0, stdout="", stderr="")
         with mock.patch.object(phases_impl.os, "cpu_count", return_value=48), \
